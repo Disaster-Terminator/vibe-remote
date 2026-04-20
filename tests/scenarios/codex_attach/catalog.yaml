@@ -1,0 +1,32 @@
+version: 1
+capability:
+  id: codex_attach
+  name: Codex external attach continuity
+  canonical_tests:
+    - tests/scenarios/codex_attach/test_codex_attach_scenarios.py
+  shared_harness:
+    - tests/scenario_harness/core.py
+    - tests/scenario_harness/codex_attach.py
+status_legend:
+  covered: scenario coverage exists
+  partial: unit or contract coverage exists but the closed loop is incomplete
+  manual: currently validated only by human regression
+  gap: not covered yet
+scenarios:
+  - id: CODEX-ATTACH-001
+    name: Safe external resume keeps the same Codex thread bound to the IM conversation
+    status: covered
+    kind: happy_path
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/codex_attach/test_codex_attach_scenarios.py::test_external_resume_scenario_keeps_the_same_codex_thread
+  - id: CODEX-ATTACH-002
+    name: Ambiguous duplicate ownership forces a fork before the next turn
+    status: covered
+    kind: safety_path
+    layer: scenario
+    backend: codex
+    test: tests/scenarios/codex_attach/test_codex_attach_scenarios.py::test_ambiguous_duplicate_resume_scenario_forks_to_a_new_codex_thread
+next_priority:
+  - CODEX-ATTACH-101
+  - CODEX-ATTACH-201

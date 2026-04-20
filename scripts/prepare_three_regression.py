@@ -283,11 +283,53 @@ def _ensure_shared_home(output_root: Path, reset_mode: str = "none") -> Path:
     for subdir in (
         ".claude",
         ".codex",
+        ".opencode/bin",
         ".config/opencode",
         ".local/share/opencode",
     ):
         (shared_root / subdir).mkdir(parents=True, exist_ok=True)
     return shared_root
+
+
+def _resolve_opencode_binary_source() -> Path | None:
+    configured = _optional("THREE_REGRESSION_OPENCODE_CLI_PATH")
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+
+    candidates.append(Path.home() / ".opencode" / "bin" / "opencode")
+
+    which_path = shutil.which("opencode")
+    if which_path:
+        candidates.append(Path(which_path))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_file() and os.access(resolved, os.X_OK):
+            return resolved
+    return None
+
+
+def _stage_opencode_binary(output_root: Path) -> None:
+    shared_root = _ensure_shared_home(output_root)
+    target = shared_root / ".opencode" / "bin" / "opencode"
+    source = _resolve_opencode_binary_source()
+
+    if source is None:
+        if target.is_file() and os.access(target, os.X_OK):
+            return
+        raise SystemExit(
+            "Missing OpenCode CLI for regression build. Set THREE_REGRESSION_OPENCODE_CLI_PATH or install opencode locally."
+        )
+
+    if target.exists():
+        target.unlink()
+    shutil.copy2(source, target)
+    target.chmod(target.stat().st_mode | 0o111)
 
 
 def _validate_reset_mode(reset_mode: str) -> None:
@@ -466,6 +508,8 @@ def prepare(output_root: Path, reset_mode: str = "none") -> None:
 
     if needs_shared_agent_configs:
         _write_shared_agent_configs(output_root, reset_mode=reset_mode)
+
+    _stage_opencode_binary(output_root)
 
     _ensure_vibe_dir(vibe_dir, reset_mode=reset_mode)
 

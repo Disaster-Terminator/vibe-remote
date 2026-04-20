@@ -31,6 +31,11 @@ htmlcov/
 
 # Project
 _tmp/
+!_tmp/three-regression/
+!_tmp/three-regression/shared-home/
+!_tmp/three-regression/shared-home/.opencode/
+!_tmp/three-regression/shared-home/.opencode/bin/
+!_tmp/three-regression/shared-home/.opencode/bin/opencode
 tmp/
 logs/
 .vibe_remote/

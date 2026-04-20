@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -341,3 +342,46 @@ def test_prepare_all_platform_channel_routing(tmp_path: Path, monkeypatch: pytes
     settings = json.loads((tmp_path / "vibe" / "state" / "settings.json").read_text(encoding="utf-8"))
     assert settings["scopes"]["channel"]["wechat"]["wx_test_room"]["routing"]["agent_backend"] == "codex"
     assert settings["scopes"]["channel"]["slack"]["C123SLACK"]["routing"]["agent_backend"] == "opencode"
+
+
+def test_prepare_stages_local_opencode_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = _load_module()
+    _set_required_env(monkeypatch)
+
+    source_bin = tmp_path / "host-bin" / "opencode"
+    source_bin.parent.mkdir(parents=True)
+    source_bin.write_text("#!/bin/sh\necho 1.4.11\n", encoding="utf-8")
+    source_bin.chmod(0o755)
+    monkeypatch.setenv("THREE_REGRESSION_OPENCODE_CLI_PATH", str(source_bin))
+
+    module.prepare(tmp_path, reset_mode="config")
+
+    staged = tmp_path / "shared-home" / ".opencode" / "bin" / "opencode"
+    assert staged.exists()
+    assert staged.read_text(encoding="utf-8") == source_bin.read_text(encoding="utf-8")
+    assert os.access(staged, os.X_OK)
+
+
+def test_prepare_prefers_real_home_opencode_binary_over_path_wrapper(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    module = _load_module()
+    _set_required_env(monkeypatch)
+
+    fake_home = tmp_path / "fake-home"
+    home_bin = fake_home / ".opencode" / "bin" / "opencode"
+    home_bin.parent.mkdir(parents=True)
+    home_bin.write_text("#!/bin/sh\necho real-home-binary\n", encoding="utf-8")
+    home_bin.chmod(0o755)
+
+    wrapper_dir = tmp_path / "wrapper-bin"
+    wrapper = wrapper_dir / "opencode"
+    wrapper_dir.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\necho path-wrapper\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", f"{wrapper_dir}:{os.environ.get('PATH', '')}")
+
+    module.prepare(tmp_path, reset_mode="config")
+
+    staged = tmp_path / "shared-home" / ".opencode" / "bin" / "opencode"
+    assert staged.read_text(encoding="utf-8") == home_bin.read_text(encoding="utf-8")
