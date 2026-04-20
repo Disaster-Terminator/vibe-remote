@@ -10,7 +10,12 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, Union
 
-from config.v2_sessions import ActivePollInfo, SessionsStore
+from config.v2_sessions import (
+    ActivePollInfo,
+    CodexExternalAttachmentBinding,
+    CodexExternalAttachmentRecord,
+    SessionsStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +225,66 @@ class SessionsFacade:
             user_id: {agent: dict(agent_map) for agent, agent_map in (agents or {}).items()}
             for user_id, agents in mappings.items()
         }
+
+    def upsert_codex_external_attachment(
+        self,
+        session_key: Union[int, str],
+        base_session_id: str,
+        *,
+        binding_origin: str,
+        codex_thread_id: str,
+        attach_mode: str,
+        workspace_realpath: str,
+        workspace_repo_root: Optional[str],
+        workspace_fingerprint: str,
+        forked_from_thread_id: Optional[str],
+        attached_at: Optional[str],
+        last_validated_at: Optional[str],
+        validation_status: str,
+    ) -> None:
+        session_scope = str(session_key)
+        attachment = CodexExternalAttachmentRecord(
+            binding_origin=binding_origin,
+            codex_thread_id=codex_thread_id,
+            attach_mode=attach_mode,
+            workspace_realpath=workspace_realpath,
+            workspace_repo_root=workspace_repo_root,
+            workspace_fingerprint=workspace_fingerprint,
+            forked_from_thread_id=forked_from_thread_id,
+            attached_at=attached_at,
+            last_validated_at=last_validated_at,
+            validation_status=validation_status,
+        )
+        self.sessions_store.upsert_codex_external_attachment(session_scope, base_session_id, attachment)
+        logger.info(
+            "Upserted Codex external attachment for %s/%s -> %s",
+            session_scope,
+            base_session_id,
+            codex_thread_id,
+        )
+
+    def get_codex_external_attachment(
+        self,
+        session_key: Union[int, str],
+        base_session_id: str,
+    ) -> Optional[CodexExternalAttachmentRecord]:
+        return self.sessions_store.get_codex_external_attachment(str(session_key), base_session_id)
+
+    def clear_codex_external_attachment(
+        self,
+        session_key: Union[int, str],
+        base_session_id: str,
+    ) -> bool:
+        cleared = self.sessions_store.clear_codex_external_attachment(str(session_key), base_session_id)
+        if cleared:
+            logger.info("Cleared Codex external attachment for %s/%s", session_key, base_session_id)
+        return cleared
+
+    def find_codex_external_attachments_by_thread_id(
+        self,
+        codex_thread_id: str,
+    ) -> List[CodexExternalAttachmentBinding]:
+        return self.sessions_store.find_codex_external_attachments_by_thread_id(codex_thread_id)
 
     def set_session_mapping(self, user_id: Union[int, str], thread_id: str, claude_session_id: str) -> None:
         self.set_agent_session_mapping(user_id, "claude", thread_id, claude_session_id)

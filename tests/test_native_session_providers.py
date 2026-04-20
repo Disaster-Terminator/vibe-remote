@@ -1,10 +1,20 @@
+import asyncio
 import os
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import sqlite3
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
+from modules.agents.codex.attach_service import (
+    CodexThreadListResult,
+    CodexThreadSummary,
+    CodexWorkspaceIdentity,
+    CodexWorkspaceValidationResult,
+)
 from modules.agents.native_sessions.base import build_resume_preview, build_tail_preview
 from modules.agents.native_sessions import claude as claude_module
 from modules.agents.native_sessions.claude import ClaudeNativeSessionProvider, encode_project_path
@@ -12,7 +22,58 @@ from modules.agents.native_sessions import codex as codex_module
 from modules.agents.native_sessions.codex import CodexNativeSessionProvider
 from modules.agents.native_sessions import service as service_module
 from modules.agents.native_sessions.service import AgentNativeSessionService
-from modules.agents.native_sessions.types import NativeResumeSession
+from modules.agents.native_sessions.types import AgentName, AgentPrefix, NativeResumeSession
+
+
+def _codex_workspace_identity(cwd: str) -> CodexWorkspaceIdentity:
+    return CodexWorkspaceIdentity(
+        cwd=cwd,
+        realpath=cwd,
+        repo_root=cwd,
+        workspace_fingerprint=f"repo:{cwd}",
+    )
+
+
+def _codex_validation(
+    requested_workspace: CodexWorkspaceIdentity,
+    *,
+    candidate_workspace: CodexWorkspaceIdentity | None,
+    status: str,
+    is_valid: bool,
+    message: str,
+) -> CodexWorkspaceValidationResult:
+    return CodexWorkspaceValidationResult(
+        requested_workspace=requested_workspace,
+        candidate_workspace=candidate_workspace,
+        status=status,
+        is_valid=is_valid,
+        message=message,
+    )
+
+
+def _write_codex_threads_db(db_path: Path, working_path: str, rows: list[tuple]) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                created_at REAL,
+                updated_at REAL,
+                title TEXT,
+                first_user_message TEXT,
+                rollout_path TEXT,
+                cwd TEXT,
+                archived INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO threads (id, created_at, updated_at, title, first_user_message, rollout_path, cwd, archived)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [(session_id, created_at, updated_at, title, first_user_message, rollout_path, working_path, archived) for session_id, created_at, updated_at, title, first_user_message, rollout_path, archived in rows],
+        )
 
 
 def test_claude_provider_falls_back_to_history_jsonl(tmp_path: Path) -> None:
@@ -160,8 +221,259 @@ def test_codex_provider_skips_empty_rollout_path(monkeypatch) -> None:
     assert hydrated.last_agent_tail == "Fallback title"
 
 
+def test_codex_attach_provider_emits_attach_aware_metadata(tmp_path: Path) -> None:
+    working_path = tmp_path / "repo"
+    working_path.mkdir()
+    (working_path / ".git").mkdir()
+    rollout_path = working_path / "thread-1.jsonl"
+    rollout_path.write_text(
+        json.dumps(
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Attach-aware preview from rollout"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    requested_workspace = _codex_workspace_identity(str(working_path))
+    summary = CodexThreadSummary(
+        thread_id="thread-1",
+        thread={
+            "id": "thread-1",
+            "name": "Investigate flaky test",
+            "preview": "Why is the test flaky?",
+            "createdAt": 10,
+            "updatedAt": 20,
+            "path": str(rollout_path),
+            "cwd": str(working_path),
+            "forkedFromId": None,
+            "ephemeral": False,
+        },
+        workspace=requested_workspace,
+        workspace_validation=_codex_validation(
+            requested_workspace,
+            candidate_workspace=requested_workspace,
+            status="valid",
+            is_valid=True,
+            message="Workspace validation succeeded.",
+        ),
+    )
+    attach_service = SimpleNamespace(
+        list_threads=AsyncMock(return_value=CodexThreadListResult(threads=[summary], next_cursor=None, raw_result={}))
+    )
+    provider = CodexNativeSessionProvider(
+        db_path=str(tmp_path / "missing.sqlite"),
+        attach_service=cast(Any, attach_service),
+    )
+
+    async def _collect() -> list[NativeResumeSession]:
+        return provider.list_metadata(str(working_path))
+
+    items = asyncio.run(_collect())
+
+    attach_service.list_threads.assert_awaited_once_with(str(working_path))
+    assert [item.native_session_id for item in items] == ["thread-1"]
+    assert items[0].locator["thread_id"] == "thread-1"
+    assert items[0].locator["title"] == "Investigate flaky test"
+    assert items[0].locator["preview"] == "Why is the test flaky?"
+    assert items[0].locator["validation_status"] == "valid"
+    assert items[0].locator["workspace_match"] is True
+    assert items[0].locator["materialized_history"] is True
+    assert items[0].locator["last_activity_ts"] == 20
+    assert items[0].locator["allowed_actions"] == ["resume", "fork"]
+
+    hydrated = provider.hydrate_preview(items[0])
+
+    assert hydrated.last_agent_message == "Attach-aware preview from rollout"
+    assert hydrated.last_agent_tail.startswith("...")
+
+
+def test_codex_attach_fallback_when_attach_service_unavailable(tmp_path: Path) -> None:
+    working_path = str(tmp_path / "repo")
+    Path(working_path).mkdir()
+    db_path = tmp_path / "state_5.sqlite"
+    _write_codex_threads_db(
+        db_path,
+        working_path,
+        [("thread-sqlite", 10, 25, "Fallback title", "Fallback first prompt", "", 0)],
+    )
+    attach_service = SimpleNamespace(list_threads=AsyncMock(side_effect=RuntimeError("app server offline")))
+    provider = CodexNativeSessionProvider(db_path=str(db_path), attach_service=cast(Any, attach_service))
+
+    items = provider.list_metadata(working_path)
+
+    attach_service.list_threads.assert_awaited_once_with(working_path)
+    assert [item.native_session_id for item in items] == ["thread-sqlite"]
+    assert items[0].locator["attach_source"] == "sqlite_fallback"
+    assert items[0].locator["attach_service_available"] is False
+    assert items[0].locator["validation_status"] == "attach_unavailable"
+    assert items[0].locator["allowed_actions"] == ["inspect_only"]
+
+    hydrated = provider.hydrate_preview(items[0])
+
+    assert hydrated.last_agent_message == "Fallback title"
+    assert hydrated.last_agent_tail == "Fallback title"
+
+
+def test_codex_attach_materialized_history_policy_marks_restricted_candidates(tmp_path: Path) -> None:
+    working_path = tmp_path / "repo"
+    other_path = tmp_path / "other"
+    working_path.mkdir()
+    other_path.mkdir()
+    (working_path / ".git").mkdir()
+    (other_path / ".git").mkdir()
+    requested_workspace = _codex_workspace_identity(str(working_path))
+    other_workspace = _codex_workspace_identity(str(other_path))
+    materialized_path = working_path / "thread-materialized.jsonl"
+    materialized_path.write_text("", encoding="utf-8")
+    attach_service = SimpleNamespace(
+        list_threads=AsyncMock(
+            return_value=CodexThreadListResult(
+                threads=[
+                    CodexThreadSummary(
+                        thread_id="thread-materialized",
+                        thread={
+                            "id": "thread-materialized",
+                            "name": "Safe attach",
+                            "preview": "safe",
+                            "createdAt": 10,
+                            "updatedAt": 30,
+                            "path": str(materialized_path),
+                            "cwd": str(working_path),
+                            "ephemeral": False,
+                        },
+                        workspace=requested_workspace,
+                        workspace_validation=_codex_validation(
+                            requested_workspace,
+                            candidate_workspace=requested_workspace,
+                            status="valid",
+                            is_valid=True,
+                            message="Workspace validation succeeded.",
+                        ),
+                    ),
+                    CodexThreadSummary(
+                        thread_id="thread-unmaterialized",
+                        thread={
+                            "id": "thread-unmaterialized",
+                            "name": "Needs inspect",
+                            "preview": "inspect",
+                            "createdAt": 11,
+                            "updatedAt": 31,
+                            "path": None,
+                            "cwd": str(working_path),
+                            "ephemeral": True,
+                        },
+                        workspace=requested_workspace,
+                        workspace_validation=_codex_validation(
+                            requested_workspace,
+                            candidate_workspace=requested_workspace,
+                            status="valid",
+                            is_valid=True,
+                            message="Workspace validation succeeded.",
+                        ),
+                    ),
+                    CodexThreadSummary(
+                        thread_id="thread-mismatch",
+                        thread={
+                            "id": "thread-mismatch",
+                            "name": "Wrong workspace",
+                            "preview": "mismatch",
+                            "createdAt": 12,
+                            "updatedAt": 32,
+                            "path": str(materialized_path),
+                            "cwd": str(other_path),
+                            "ephemeral": False,
+                        },
+                        workspace=other_workspace,
+                        workspace_validation=_codex_validation(
+                            requested_workspace,
+                            candidate_workspace=other_workspace,
+                            status="realpath_mismatch",
+                            is_valid=False,
+                            message="Normalized working directory does not match the target thread workspace.",
+                        ),
+                    ),
+                ],
+                next_cursor=None,
+                raw_result={},
+            )
+        )
+    )
+    provider = CodexNativeSessionProvider(
+        db_path=str(tmp_path / "missing.sqlite"),
+        attach_service=cast(Any, attach_service),
+    )
+
+    items = provider.list_metadata(str(working_path))
+    items_by_id = {item.native_session_id: item for item in items}
+
+    assert items_by_id["thread-materialized"].locator["allowed_actions"] == ["resume", "fork"]
+    assert items_by_id["thread-materialized"].locator["materialized_history"] is True
+    assert items_by_id["thread-unmaterialized"].locator["allowed_actions"] == ["inspect_only"]
+    assert items_by_id["thread-unmaterialized"].locator["materialized_history"] is False
+    assert items_by_id["thread-mismatch"].locator["validation_status"] == "realpath_mismatch"
+    assert items_by_id["thread-mismatch"].locator["workspace_match"] is False
+    assert items_by_id["thread-mismatch"].locator["allowed_actions"] == ["inspect_only"]
+
+
+def test_codex_attach_provider_marks_unverifiable_candidates_inspect_only(tmp_path: Path) -> None:
+    working_path = tmp_path / "repo"
+    working_path.mkdir()
+    (working_path / ".git").mkdir()
+    materialized_path = working_path / "thread-unverifiable.jsonl"
+    materialized_path.write_text("", encoding="utf-8")
+    requested_workspace = _codex_workspace_identity(str(working_path))
+    attach_service = SimpleNamespace(
+        list_threads=AsyncMock(
+            return_value=CodexThreadListResult(
+                threads=[
+                    CodexThreadSummary(
+                        thread_id="thread-unverifiable",
+                        thread={
+                            "id": "thread-unverifiable",
+                            "name": "Missing cwd",
+                            "preview": "inspect first",
+                            "createdAt": 10,
+                            "updatedAt": 20,
+                            "path": str(materialized_path),
+                            "ephemeral": False,
+                        },
+                        workspace=None,
+                        workspace_validation=_codex_validation(
+                            requested_workspace,
+                            candidate_workspace=None,
+                            status="unverifiable",
+                            is_valid=False,
+                            message="Target workspace metadata is missing, so attach safety cannot be verified.",
+                        ),
+                    )
+                ],
+                next_cursor=None,
+                raw_result={},
+            )
+        )
+    )
+    provider = CodexNativeSessionProvider(
+        db_path=str(tmp_path / "missing.sqlite"),
+        attach_service=cast(Any, attach_service),
+    )
+
+    items = provider.list_metadata(str(working_path))
+
+    assert [item.native_session_id for item in items] == ["thread-unverifiable"]
+    assert items[0].locator["validation_status"] == "unverifiable"
+    assert items[0].locator["workspace_match"] is False
+    assert items[0].locator["workspace_realpath"] == ""
+    assert items[0].locator["allowed_actions"] == ["inspect_only"]
+
+
 def test_native_session_service_preserves_agent_visibility_when_limited() -> None:
-    def _item(agent: str, prefix: str, session_id: str, sort_ts: float) -> NativeResumeSession:
+    def _item(agent: AgentName, prefix: AgentPrefix, session_id: str, sort_ts: float) -> NativeResumeSession:
         return NativeResumeSession(
             agent=agent,
             agent_prefix=prefix,
@@ -190,7 +502,7 @@ def test_native_session_service_preserves_agent_visibility_when_limited() -> Non
         hydrate_preview=lambda item: item,
     )
 
-    service = AgentNativeSessionService(providers=[oc_provider, cc_provider, cx_provider])
+    service = AgentNativeSessionService(providers=cast(Any, [oc_provider, cc_provider, cx_provider]))
 
     items = service.list_recent_sessions("/tmp/project", limit=5)
 

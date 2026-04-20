@@ -69,12 +69,66 @@ class ActivePollInfo:
 
 
 @dataclass
+class CodexExternalAttachmentRecord:
+    """Persisted metadata for a Codex thread attached outside Vibe-created mappings."""
+
+    binding_origin: str = ""
+    codex_thread_id: str = ""
+    attach_mode: str = ""
+    workspace_realpath: str = ""
+    workspace_repo_root: Optional[str] = None
+    workspace_fingerprint: str = ""
+    forked_from_thread_id: Optional[str] = None
+    attached_at: Optional[str] = None
+    last_validated_at: Optional[str] = None
+    validation_status: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "binding_origin": self.binding_origin,
+            "codex_thread_id": self.codex_thread_id,
+            "attach_mode": self.attach_mode,
+            "workspace_realpath": self.workspace_realpath,
+            "workspace_repo_root": self.workspace_repo_root,
+            "workspace_fingerprint": self.workspace_fingerprint,
+            "forked_from_thread_id": self.forked_from_thread_id,
+            "attached_at": self.attached_at,
+            "last_validated_at": self.last_validated_at,
+            "validation_status": self.validation_status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CodexExternalAttachmentRecord":
+        return cls(
+            binding_origin=data.get("binding_origin", ""),
+            codex_thread_id=data.get("codex_thread_id", ""),
+            attach_mode=data.get("attach_mode", ""),
+            workspace_realpath=data.get("workspace_realpath", ""),
+            workspace_repo_root=data.get("workspace_repo_root"),
+            workspace_fingerprint=data.get("workspace_fingerprint", ""),
+            forked_from_thread_id=data.get("forked_from_thread_id"),
+            attached_at=data.get("attached_at"),
+            last_validated_at=data.get("last_validated_at"),
+            validation_status=data.get("validation_status", ""),
+        )
+
+
+@dataclass
+class CodexExternalAttachmentBinding:
+    session_key: str
+    base_session_id: str
+    attachment: CodexExternalAttachmentRecord
+
+
+@dataclass
 class SessionState:
     # session_mappings: user_id -> agent_name -> thread_id -> session_id
     session_mappings: Dict[str, Dict[str, Dict[str, str]]] = field(default_factory=dict)
     active_slack_threads: Dict[str, Dict[str, Dict[str, float]]] = field(default_factory=dict)
     # active_polls: opencode_session_id -> ActivePollInfo
     active_polls: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # codex_external_attachments: session_key -> base_session_id -> CodexExternalAttachmentRecord
+    codex_external_attachments: Dict[str, Dict[str, Dict[str, Any]]] = field(default_factory=dict)
     # processed_message_ts: channel_id -> thread_ts -> list of processed message IDs
     # (set-based dedup, supports all platforms including Feishu non-monotonic IDs)
     processed_message_ts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -98,6 +152,7 @@ class SessionsStore:
             session_mappings=payload.get("session_mappings", {}),
             active_slack_threads=payload.get("active_slack_threads", {}),
             active_polls=payload.get("active_polls", {}),
+            codex_external_attachments=payload.get("codex_external_attachments", {}),
             processed_message_ts=payload.get("processed_message_ts", {}),
             last_activity=payload.get("last_activity"),
         )
@@ -252,6 +307,66 @@ class SessionsStore:
             self.state.active_slack_threads[user_id][channel_id] = channel_map
         return channel_map
 
+    def get_codex_external_attachment_map(self, session_key: str) -> Dict[str, Dict[str, Any]]:
+        attachment_map = self.state.codex_external_attachments.get(session_key)
+        if attachment_map is None:
+            attachment_map = {}
+            self.state.codex_external_attachments[session_key] = attachment_map
+        return attachment_map
+
+    def upsert_codex_external_attachment(
+        self,
+        session_key: str,
+        base_session_id: str,
+        attachment: CodexExternalAttachmentRecord,
+    ) -> None:
+        attachment_map = self.get_codex_external_attachment_map(session_key)
+        attachment_map[base_session_id] = attachment.to_dict()
+        self.save()
+
+    def get_codex_external_attachment(
+        self,
+        session_key: str,
+        base_session_id: str,
+    ) -> Optional[CodexExternalAttachmentRecord]:
+        attachment_map = self.state.codex_external_attachments.get(session_key, {})
+        data = attachment_map.get(base_session_id)
+        if isinstance(data, dict):
+            return CodexExternalAttachmentRecord.from_dict(data)
+        return None
+
+    def clear_codex_external_attachment(self, session_key: str, base_session_id: str) -> bool:
+        attachment_map = self.state.codex_external_attachments.get(session_key)
+        if not attachment_map or base_session_id not in attachment_map:
+            return False
+
+        del attachment_map[base_session_id]
+        if not attachment_map:
+            del self.state.codex_external_attachments[session_key]
+        self.save()
+        return True
+
+    def find_codex_external_attachments_by_thread_id(
+        self,
+        codex_thread_id: str,
+    ) -> List[CodexExternalAttachmentBinding]:
+        matches: List[CodexExternalAttachmentBinding] = []
+        for session_key, attachment_map in self.state.codex_external_attachments.items():
+            if not isinstance(attachment_map, dict):
+                continue
+            for base_session_id, data in attachment_map.items():
+                if not isinstance(data, dict) or data.get("codex_thread_id") != codex_thread_id:
+                    continue
+                matches.append(
+                    CodexExternalAttachmentBinding(
+                        session_key=session_key,
+                        base_session_id=base_session_id,
+                        attachment=CodexExternalAttachmentRecord.from_dict(data),
+                    )
+                )
+        matches.sort(key=lambda binding: (binding.session_key, binding.base_session_id))
+        return matches
+
     # Max number of message IDs to keep per thread for dedup
     _DEDUP_SET_MAX = 200
 
@@ -333,6 +448,7 @@ class SessionsStore:
             "session_mappings": self.state.session_mappings,
             "active_slack_threads": self.state.active_slack_threads,
             "active_polls": self.state.active_polls,
+            "codex_external_attachments": self.state.codex_external_attachments,
             "processed_message_ts": self.state.processed_message_ts,
             "last_activity": self.state.last_activity,
         }

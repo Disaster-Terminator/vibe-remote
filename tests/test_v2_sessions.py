@@ -1,5 +1,7 @@
+import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -11,16 +13,66 @@ from modules.sessions_facade import SessionsFacade
 def test_sessions_store_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "get_vibe_remote_dir", lambda: tmp_path / ".vibe_remote")
     store = SessionsStore()
-    store.state.session_mappings = {"U1": {"claude": {"base": {"/tmp": "session-1"}}}}
+    store.state.session_mappings = cast(Any, {"U1": {"claude": {"base": {"/tmp": "session-1"}}}})
+    store.state.codex_external_attachments = {
+        "slack::C1": {
+            "base-session-1": {
+                "binding_origin": "external_attached",
+                "codex_thread_id": "codex-thread-1",
+                "attach_mode": "resume",
+                "workspace_realpath": "/tmp/project",
+                "workspace_repo_root": "/tmp/project",
+                "workspace_fingerprint": "repo:/tmp/project",
+                "forked_from_thread_id": None,
+                "attached_at": "2026-01-18T11:59:00Z",
+                "last_validated_at": "2026-01-18T12:00:00Z",
+                "validation_status": "valid",
+            }
+        }
+    }
     store.state.active_slack_threads = {"U1": {"C1": {"123.456": 1.0}}}
     store.state.last_activity = "2026-01-18T12:00:00Z"
     store.save()
 
     reloaded = SessionsStore()
     reloaded.load()
-    assert reloaded.state.session_mappings["U1"]["claude"]["base"]["/tmp"] == "session-1"
+    claude_state = cast(Any, reloaded.state.session_mappings["U1"]["claude"])
+    assert claude_state["base"]["/tmp"] == "session-1"
+    assert reloaded.state.codex_external_attachments["slack::C1"]["base-session-1"]["codex_thread_id"] == "codex-thread-1"
     assert reloaded.state.active_slack_threads["U1"]["C1"]["123.456"] == 1.0
     assert reloaded.state.last_activity == "2026-01-18T12:00:00Z"
+
+
+def test_sessions_store_legacy_load_defaults_codex_external_attachments(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "get_vibe_remote_dir", lambda: tmp_path / ".vibe_remote")
+    store = SessionsStore()
+    store.sessions_path.parent.mkdir(parents=True, exist_ok=True)
+    store.sessions_path.write_text(
+        json.dumps(
+            {
+                "session_mappings": {"slack::C123": {"codex": {"base-session-1": "native-thread-1"}}},
+                "active_slack_threads": {"U1": {"C1": {"123.456": 1.0}}},
+                "active_polls": {},
+                "processed_message_ts": {},
+                "last_activity": "2026-01-18T12:00:00Z",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    reloaded = SessionsStore()
+    reloaded.load()
+
+    assert reloaded.state.codex_external_attachments == {}
+    assert reloaded.state.session_mappings["slack::C123"]["codex"]["base-session-1"] == "native-thread-1"
+
+    reloaded.save()
+
+    reloaded_again = SessionsStore()
+    reloaded_again.load()
+    assert reloaded_again.state.codex_external_attachments == {}
+    assert reloaded_again.state.session_mappings["slack::C123"]["codex"]["base-session-1"] == "native-thread-1"
 
 
 def test_sessions_store_namespaces(tmp_path, monkeypatch):
