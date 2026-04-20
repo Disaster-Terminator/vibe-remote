@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -2164,7 +2165,7 @@ class FeishuBot(BaseIMClient):
         if attach is None:
             return
 
-        token = str(time.time_ns())
+        token = secrets.token_urlsafe(24)
         self._resume_attach_cache[token] = {
             "user_id": context.user_id,
             "channel_id": context.channel_id,
@@ -2177,7 +2178,7 @@ class FeishuBot(BaseIMClient):
         }
 
         lines = [f"🔎 {self._t('modal.resume.codexInspectTitle', context.channel_id)}"]
-        lines.extend(build_codex_attach_summary_lines(attach))
+        lines.extend(build_codex_attach_summary_lines(attach, t=lambda key: self._t(key, context.channel_id)))
         rows: list[list[InlineButton]] = []
         if attach.is_actionable:
             lines.append("")
@@ -2201,6 +2202,11 @@ class FeishuBot(BaseIMClient):
         cached = self._resume_attach_cache.get(token)
         if not cached:
             await self.send_message(context, f"ℹ️ {self._t('modal.resume.codexUnsupportedHint', context.channel_id)}")
+            return
+        if (cached.get("user_id") and cached.get("user_id") != context.user_id) or (
+            cached.get("channel_id") and cached.get("channel_id") != context.channel_id
+        ):
+            await self.send_message(context, f"❌ {self._t('error.resumeInteractionExpiredOrUnauthorized', context.channel_id)}")
             return
         if action == "cancel":
             self._resume_attach_cache.pop(token, None)

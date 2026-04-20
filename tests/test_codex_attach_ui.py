@@ -182,6 +182,7 @@ _install_discord_stubs()
 from modules.im.discord import DiscordBot
 from modules.im.feishu import FeishuBot
 from modules.im.resume_picker import build_resume_picker_entries
+from modules.im.resume_picker import build_codex_attach_summary_lines
 from modules.im.slack import SlackBot
 from modules.im.telegram import TelegramBot, _TelegramResumeSessionState
 
@@ -189,6 +190,7 @@ from modules.im.telegram import TelegramBot, _TelegramResumeSessionState
 _TRANSLATIONS: dict[str, str] = {
     "common.resume": "Resume",
     "common.fork": "Fork",
+    "common.none": "None",
     "common.back": "Back",
     "common.cancel": "Cancel",
     "modal.resume.title": "Resume Session",
@@ -212,7 +214,18 @@ _TRANSLATIONS: dict[str, str] = {
     "modal.resume.codexInspectPrompt": "Choose Resume or Fork.",
     "modal.resume.codexActionLabel": "Codex attach action",
     "modal.resume.codexActionPlaceholder": "Choose Resume or Fork",
+    "modal.resume.codexActionInspectOnly": "Inspect only",
     "modal.resume.codexUnsupportedHint": "This Codex candidate is preview-only here. Direct Resume/Fork actions are unavailable for this thread.",
+    "modal.resume.codexSummaryThreadLabel": "Thread:",
+    "modal.resume.codexSummaryValidationLabel": "Validation:",
+    "modal.resume.codexSummaryAllowedActionsLabel": "Allowed actions:",
+    "modal.resume.codexSummaryPreviewLabel": "Preview:",
+    "modal.resume.codexWorkspaceMatch": "workspace match",
+    "modal.resume.codexWorkspaceMismatch": "workspace mismatch",
+    "error.codexAttachValidationReason.valid": "validation ok",
+    "error.codexAttachValidationReason.realpath_mismatch": "validation mismatch",
+    "error.codexAttachValidationReason.attach_unavailable": "catalog unavailable",
+    "error.codexAttachValidationReason.unknown": "validation unknown",
     "telegram.resumeTitle": "Resume a saved session",
     "telegram.resumeBody": "Pick a saved session.",
     "telegram.resumeNoStoredSessions": "No stored sessions.",
@@ -341,6 +354,7 @@ class _FakeDiscordResponse:
     def __init__(self):
         self.defer = AsyncMock()
         self.edit_message = AsyncMock()
+        self.send_message = AsyncMock()
 
     def is_done(self):
         return False
@@ -354,6 +368,58 @@ class _FakeDiscordInteraction:
 
 
 class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
+    def test_codex_attach_summary_uses_translator_instead_of_hardcoded_english(self):
+        attach = build_resume_picker_entries([_codex_attach_session()])[0].codex_attach
+        assert attach is not None
+        lines = build_codex_attach_summary_lines(
+            attach,
+            t=_t,
+        )
+
+        self.assertEqual(
+            lines,
+            [
+                "Thread: External Codex Thread",
+                "Validation: validation ok / workspace match",
+                "Allowed actions: Resume, Fork",
+                "Preview: Inspect this external Codex thread before binding.",
+            ],
+        )
+
+        mismatch_entry = build_resume_picker_entries([_codex_attach_session(allowed_actions=["inspect_only"])])[0]
+        mismatch_attach = mismatch_entry.codex_attach
+        assert mismatch_attach is not None
+        mismatch_attach = mismatch_attach.__class__(
+            codex_thread_id=mismatch_attach.codex_thread_id,
+            title=mismatch_attach.title,
+            preview=mismatch_attach.preview,
+            validation_status="realpath_mismatch",
+            workspace_match=False,
+            allowed_actions=("inspect_only",),
+            actionable_actions=(),
+            submission_payloads={},
+            inspect_first=True,
+        )
+        mismatch_lines = build_codex_attach_summary_lines(mismatch_attach, t=_t)
+        self.assertIn("Validation: validation mismatch / workspace mismatch", mismatch_lines)
+        self.assertIn("Allowed actions: Inspect only", mismatch_lines)
+
+        no_action_attach = mismatch_attach.__class__(
+            codex_thread_id=mismatch_attach.codex_thread_id,
+            title=mismatch_attach.title,
+            preview="",
+            validation_status="attach_unavailable",
+            workspace_match=None,
+            allowed_actions=(),
+            actionable_actions=(),
+            submission_payloads={},
+            inspect_first=True,
+        )
+        no_action_lines = build_codex_attach_summary_lines(no_action_attach, t=_t)
+        self.assertIn("Validation: catalog unavailable", no_action_lines)
+        self.assertIn("Allowed actions: None", no_action_lines)
+        self.assertEqual(len(no_action_lines), 3)
+
     def test_resume_picker_entries_leave_non_codex_items_unchanged(self):
         entries = build_resume_picker_entries([_claude_session()])
         self.assertEqual(len(entries), 1)
@@ -585,7 +651,8 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Fork", labels)
         select_interaction.response.edit_message.assert_awaited()
         edit_call = select_interaction.response.edit_message.await_args_list[0]
-        self.assertIn("Allowed actions: Resume, Fork", edit_call.kwargs["content"])
+        self.assertIn(_TRANSLATIONS["modal.resume.codexSummaryAllowedActionsLabel"], edit_call.kwargs["content"])
+        self.assertIn("Resume, Fork", edit_call.kwargs["content"])
 
         fork_button = next(child for child in view.children if getattr(child, "label", None) == "Fork")
         await fork_button.callback(_FakeDiscordInteraction())
@@ -620,7 +687,8 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
         session_handler.handle_resume_session_submission.assert_not_awaited()
         self.assertEqual(state.selected_index, 0)
         edit_call = bot.edit_message.await_args_list[0]
-        self.assertIn("Allowed actions: Resume, Fork", edit_call.kwargs["text"])
+        self.assertIn(_TRANSLATIONS["modal.resume.codexSummaryAllowedActionsLabel"], edit_call.kwargs["text"])
+        self.assertIn("Resume, Fork", edit_call.kwargs["text"])
 
         await bot._handle_resume_callback(context, "tg_resume:action:fork")
         session_handler.handle_resume_session_submission.assert_awaited_once()
@@ -677,7 +745,8 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
         send_call = bot.send_message_with_buttons.await_args_list[0]
         sent_text = send_call.args[1]
         sent_keyboard = send_call.args[2]
-        self.assertIn("Allowed actions: Resume, Fork", sent_text)
+        self.assertIn(_TRANSLATIONS["modal.resume.codexSummaryAllowedActionsLabel"], sent_text)
+        self.assertIn("Resume, Fork", sent_text)
         callback_data = sent_keyboard.buttons[0][1].callback_data
 
         await bot._handle_resume_attach_callback(context, callback_data)
@@ -685,6 +754,57 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
         resume_call = bot._on_resume_session.await_args_list[0]
         self.assertEqual(resume_call.kwargs["action_intent"], "fork")
         self.assertEqual(resume_call.kwargs["codex_thread_id"], "thread_attach_123")
+
+    async def test_feishu_attach_callback_rejects_wrong_user_without_consuming_token(self):
+        bot = _FeishuHarness.__new__(_FeishuHarness)
+        bot._resume_attach_cache = {
+            "tok123": {
+                "user_id": "OWNER",
+                "channel_id": "LK1",
+                "thread_id": "OT1",
+                "host_message_ts": "HOST1",
+                "is_dm": False,
+                "agent": "codex",
+                "session_id": "thread_attach_123",
+                "submission_payloads": {
+                    "resume": {
+                        "agent": "codex",
+                        "session_id": "thread_attach_123",
+                        "codex_thread_id": "thread_attach_123",
+                        "action_intent": "resume",
+                    }
+                },
+            }
+        }
+        bot.send_message = AsyncMock()
+        bot._on_resume_session = AsyncMock()
+        context = MessageContext(user_id="OTHER", channel_id="LK1", thread_id="OT1", platform="lark")
+
+        await bot._handle_resume_attach_callback(context, "resume_attach:tok123:resume")
+
+        bot._on_resume_session.assert_not_awaited()
+        self.assertIn("tok123", bot._resume_attach_cache)
+        bot.send_message.assert_awaited_once()
+
+    async def test_discord_resume_view_rejects_other_user_interaction(self):
+        bot = _DiscordHarness.__new__(_DiscordHarness)
+        bot._controller = SimpleNamespace(agent_service=SimpleNamespace(agents={"codex": object(), "claude": object(), "opencode": object()}))
+        channel = _FakeDiscordChannel()
+        bot._fetch_channel = AsyncMock(return_value=channel)
+
+        await bot.open_resume_session_modal(
+            trigger_id=None,
+            sessions=[_codex_attach_session()],
+            channel_id="C1",
+            thread_id="TH1",
+            host_message_ts="MSG1",
+        )
+
+        _, view = channel.sent[0]
+        view.owner_id = "OWNER"
+
+        self.assertTrue(await view.interaction_check(_FakeDiscordInteraction(user_id="OWNER")))
+        self.assertFalse(await view.interaction_check(_FakeDiscordInteraction(user_id="OTHER")))
 
     async def test_feishu_preview_only_codex_attach_stays_preview_only(self):
         bot = _FeishuHarness.__new__(_FeishuHarness)

@@ -1295,7 +1295,9 @@ class DiscordBot(BaseIMClient):
 
             def _content(self) -> str:
                 if self.inspect_entry is not None and self.inspect_entry.codex_attach is not None:
-                    summary = "\n".join(build_codex_attach_summary_lines(self.inspect_entry.codex_attach))
+                    summary = "\n".join(
+                        build_codex_attach_summary_lines(self.inspect_entry.codex_attach, t=lambda key: t(key))
+                    )
                     if self.inspect_entry.codex_attach.is_actionable:
                         footer = t("modal.resume.codexInspectPrompt")
                     else:
@@ -1397,6 +1399,11 @@ class DiscordBot(BaseIMClient):
                 self.add_item(self.agent_select)
                 self.add_item(self.manual_button)
                 self.add_item(self.resume_button)
+
+            async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                if self.owner_id and str(interaction.user.id) != self.owner_id:
+                    return False
+                return True
 
         owner_id = str(interaction.user.id) if interaction else None
         view = ResumeView(self, owner_id)
