@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from modules.agents.native_sessions.display import format_display_summary, format_display_time
 from modules.agents.native_sessions.types import NativeResumeSession
@@ -37,6 +37,37 @@ def _normalize_codex_attach_actions(raw_actions: Any) -> tuple[str, ...]:
         if action in {"resume", "fork", "inspect_only"} and action not in actions:
             actions.append(action)
     return tuple(actions)
+
+
+def get_codex_attach_validation_reason_key(status: str) -> str:
+    normalized = str(status or "").strip() or "unknown"
+    known_statuses = {
+        "valid",
+        "unverifiable",
+        "cwd_mismatch_same_repo",
+        "realpath_mismatch",
+        "repo_root_mismatch",
+        "fingerprint_mismatch",
+        "attach_unavailable",
+        "unknown",
+    }
+    if normalized not in known_statuses:
+        normalized = "unknown"
+    return f"error.codexAttachValidationReason.{normalized}"
+
+
+def format_codex_attach_validation_reason(status: str, t: Callable[[str], str]) -> str:
+    return t(get_codex_attach_validation_reason_key(status))
+
+
+def _format_codex_attach_action_label(action: str, t: Callable[[str], str]) -> str:
+    if action == "resume":
+        return t("common.resume")
+    if action == "fork":
+        return t("common.fork")
+    if action == "inspect_only":
+        return t("modal.resume.codexActionInspectOnly")
+    return action
 
 
 def build_resume_selection_value(agent: str, native_session_id: str) -> str:
@@ -106,7 +137,7 @@ def build_codex_attach_presentation(item: NativeResumeSession) -> Optional[Codex
 
     return CodexAttachPresentation(
         codex_thread_id=codex_thread_id,
-        title=str(payload.get("title") or locator.get("title") or "Codex thread").strip(),
+        title=str(payload.get("title") or locator.get("title") or codex_thread_id).strip(),
         preview=str(payload.get("preview") or item.last_agent_message or item.last_agent_tail or "").strip(),
         validation_status=str(payload.get("validation_status") or "unknown").strip() or "unknown",
         workspace_match=workspace_match,
@@ -197,26 +228,29 @@ def index_resume_picker_entries(entries: list[ResumePickerEntry]) -> dict[str, R
     return {entry.selection_value: entry for entry in entries}
 
 
-def build_codex_attach_summary_lines(attach: CodexAttachPresentation) -> list[str]:
-    validation_bits = [attach.validation_status]
+def build_codex_attach_summary_lines(
+    attach: CodexAttachPresentation,
+    *,
+    t: Callable[[str], str],
+) -> list[str]:
+    validation_bits = [format_codex_attach_validation_reason(attach.validation_status, t)]
     if attach.workspace_match is True:
-        validation_bits.append("workspace match")
+        validation_bits.append(t("modal.resume.codexWorkspaceMatch"))
     elif attach.workspace_match is False:
-        validation_bits.append("workspace mismatch")
+        validation_bits.append(t("modal.resume.codexWorkspaceMismatch"))
 
     if attach.allowed_actions:
         allowed_actions = ", ".join(
-            "Inspect only" if action == "inspect_only" else action.capitalize()
-            for action in attach.allowed_actions
+            _format_codex_attach_action_label(action, t) for action in attach.allowed_actions
         )
     else:
-        allowed_actions = "None"
+        allowed_actions = t("common.none")
 
     lines = [
-        f"Thread: {attach.title or attach.codex_thread_id}",
-        f"Validation: {' / '.join(validation_bits)}",
-        f"Allowed actions: {allowed_actions}",
+        f"{t('modal.resume.codexSummaryThreadLabel')} {attach.title or attach.codex_thread_id}",
+        f"{t('modal.resume.codexSummaryValidationLabel')} {' / '.join(validation_bits)}",
+        f"{t('modal.resume.codexSummaryAllowedActionsLabel')} {allowed_actions}",
     ]
     if attach.preview:
-        lines.append(f"Preview: {attach.preview}")
+        lines.append(f"{t('modal.resume.codexSummaryPreviewLabel')} {attach.preview}")
     return lines
