@@ -504,11 +504,13 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Forked thread preview should appear in confirmation.", im_client.messages[0][2])
         self.assertNotIn("Inspect this external Codex thread before binding.", im_client.messages[0][2])
 
-    async def test_codex_external_attach_validation_failure_mutates_nothing(self):
+    async def test_codex_external_attach_validation_failure_uses_localized_status_reason(self):
         settings = _StubSettingsManager()
         im_client = _StubIMClient()
         ctrl = _StubController()
-        ctrl.init_minimal(im_client, settings, _StubConfig())
+        config = _StubConfig()
+        config.language = "zh"
+        ctrl.init_minimal(im_client, settings, config)
         ctrl.native_session_service = _StubNativeSessionService(
             [_codex_attach_session(thread_id="external-thread-3", allowed_actions=["resume", "fork"])]
         )
@@ -542,7 +544,69 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.codex_attachment_upserts, [])
         self.assertEqual(len(im_client.messages), 1)
         self.assertIn("realpath_mismatch", im_client.messages[0][2])
-        self.assertIn("Normalized working directory does not match", im_client.messages[0][2])
+        self.assertIn("该线程属于另一个工作目录", im_client.messages[0][2])
+        self.assertNotIn("Normalized working directory does not match", im_client.messages[0][2])
+
+    async def test_codex_external_attach_validation_failure_unknown_status_uses_fallback_reason(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-unknown", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(
+                status="mystery_status",
+                is_valid=False,
+                message="mystery backend message",
+            ),
+            resume_result=_codex_attach_result(thread_id="external-thread-unknown", attach_mode="resume"),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-unknown",
+            action_intent="resume",
+            codex_thread_id="external-thread-unknown",
+        )
+
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("status: mystery_status", im_client.messages[0][2])
+        self.assertIn("Workspace validation failed.", im_client.messages[0][2])
+        self.assertNotIn("mystery backend message", im_client.messages[0][2])
+
+    async def test_codex_manual_attach_candidate_requires_interactive_picker(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-manual", allowed_actions=["resume", "fork"])]
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock())
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-manual",
+        )
+
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(settings.codex_attachment_upserts, [])
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("interactive inspect + Resume/Fork flow", im_client.messages[0][2])
 
     async def test_codex_external_attach_missing_result_thread_id_mutates_nothing(self):
         settings = _StubSettingsManager()

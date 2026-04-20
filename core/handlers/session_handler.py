@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, cast
 from uuid import uuid4
 from modules.im import MessageContext
+from modules.im.resume_picker import get_codex_attach_validation_reason_key
 from modules.claude_sdk_compat import ClaudeSDKClient, ClaudeAgentOptions
 from modules.agents.native_sessions.base import build_resume_preview
 
@@ -417,11 +418,31 @@ class SessionHandler(BaseHandler):
         }
 
     def _format_codex_attach_validation_error(self, validation: Any) -> str:
+        status = str(getattr(validation, "status", "unknown") or "unknown")
         return self._t(
             "error.codexAttachValidationFailed",
-            reason=getattr(validation, "message", "Workspace validation failed."),
-            status=getattr(validation, "status", "unknown"),
+            reason=self._t(get_codex_attach_validation_reason_key(status)),
+            status=status,
         )
+
+    def _assert_codex_resume_session_is_safe(
+        self,
+        context: MessageContext,
+        *,
+        session_id: str,
+        action_intent: Optional[str],
+        codex_thread_id: Optional[str],
+    ) -> None:
+        if action_intent or codex_thread_id:
+            return
+
+        item = self._get_native_session_item(context, agent="codex", session_id=session_id)
+        if item is None:
+            return
+
+        locator = dict(item.locator) if isinstance(item.locator, dict) else {}
+        if self._is_codex_attach_candidate(locator, explicit_action_intent=None):
+            raise ValueError(self._t("error.codexAttachManualSessionRequiresPicker"))
 
     def _build_codex_attach_provenance(self, *, attach_mode: str, thread_id: str, source_thread_id: Optional[str]) -> str:
         if attach_mode == "fork":
@@ -895,6 +916,12 @@ class SessionHandler(BaseHandler):
             effective_session_id = session_id
             confirmation_provenance = ""
             if agent == "codex":
+                self._assert_codex_resume_session_is_safe(
+                    context,
+                    session_id=session_id,
+                    action_intent=action_intent,
+                    codex_thread_id=codex_thread_id,
+                )
                 attach_binding = await self._execute_codex_attach_submission(
                     context,
                     session_key=session_key,
