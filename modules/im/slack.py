@@ -1840,38 +1840,41 @@ class SlackBot(BaseIMClient):
                         await self.on_callback_query_callback(context, callback_data)
                 elif action_type in {"static_select", "external_select"}:
                     action_id = action.get("action_id")
-                    # Trigger modal update for backend selection and all backend-specific selectors
-                    routing_modal_actions = {
-                        "backend_select",
-                        "opencode_agent_select",
-                        "opencode_model_select",
-                        "claude_agent_select",
-                        "claude_model_select",
-                        "codex_model_select",
-                    }
-                    # Also check for prefixed action IDs (reasoning selects have unique suffixes)
-                    should_update = (
-                        action_id in routing_modal_actions
-                        or (action_id and action_id.startswith("opencode_reasoning_select"))
-                        or (action_id and action_id.startswith("codex_reasoning_select"))
-                    )
-                    if should_update:
-                        if hasattr(self, "_on_routing_modal_update"):
-                            channel_from_view = view.get("private_metadata")
-                            effective_channel = channel_from_view or channel_id
-                            selection = parse_routing_modal_selection(
-                                view=view,
-                                action=action,
-                                default_backend="",
-                            )
-                            await self._on_routing_modal_update(
-                                user.get("id"),
-                                effective_channel,
-                                view.get("id"),
-                                view.get("hash"),
-                                selection,
-                                is_dm=isinstance(effective_channel, str) and effective_channel.startswith("D"),
-                            )
+                    if action_id == "session_select" and view.get("callback_id") == "resume_session_modal":
+                        await self._handle_resume_modal_session_select(view, action)
+                    else:
+                        # Trigger modal update for backend selection and all backend-specific selectors
+                        routing_modal_actions = {
+                            "backend_select",
+                            "opencode_agent_select",
+                            "opencode_model_select",
+                            "claude_agent_select",
+                            "claude_model_select",
+                            "codex_model_select",
+                        }
+                        # Also check for prefixed action IDs (reasoning selects have unique suffixes)
+                        should_update = (
+                            action_id in routing_modal_actions
+                            or (action_id and action_id.startswith("opencode_reasoning_select"))
+                            or (action_id and action_id.startswith("codex_reasoning_select"))
+                        )
+                        if should_update:
+                            if hasattr(self, "_on_routing_modal_update"):
+                                channel_from_view = view.get("private_metadata")
+                                effective_channel = channel_from_view or channel_id
+                                selection = parse_routing_modal_selection(
+                                    view=view,
+                                    action=action,
+                                    default_backend="",
+                                )
+                                await self._on_routing_modal_update(
+                                    user.get("id"),
+                                    effective_channel,
+                                    view.get("id"),
+                                    view.get("hash"),
+                                    selection,
+                                    is_dm=isinstance(effective_channel, str) and effective_channel.startswith("D"),
+                                )
                 elif action_type == "plain_text_input":
                     action_id = action.get("action_id")
                     # Handle manual_input in resume_session_modal - show agent_block when user types

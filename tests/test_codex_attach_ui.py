@@ -1,6 +1,7 @@
 import unittest
 import sys
 import types
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -290,6 +291,29 @@ def _codex_attach_session(*, allowed_actions=None, submission_payloads=None) -> 
     )
 
 
+def _flattened_codex_attach_session(*, allowed_actions=None) -> NativeResumeSession:
+    allowed_actions = allowed_actions or ["resume", "fork"]
+    return NativeResumeSession(
+        agent="codex",
+        agent_prefix="cx",
+        native_session_id="thread_attach_123",
+        working_path="/tmp/worktree",
+        created_at=None,
+        updated_at=None,
+        sort_ts=10.0,
+        last_agent_message="Inspect this external Codex thread before binding.",
+        last_agent_tail="...inspect before binding",
+        locator={
+            "codex_thread_id": "thread_attach_123",
+            "title": "External Codex Thread",
+            "preview": "Inspect this external Codex thread before binding.",
+            "validation_status": "valid",
+            "workspace_match": True,
+            "allowed_actions": allowed_actions,
+        },
+    )
+
+
 def _claude_session() -> NativeResumeSession:
     return NativeResumeSession(
         agent="claude",
@@ -388,6 +412,150 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(any(block.get("block_id") == "action_block" for block in view["blocks"]))
         self.assertTrue(any(_TRANSLATIONS["modal.resume.codexUnsupportedHint"] in str(block) for block in view["blocks"]))
+
+    def test_flattened_codex_locator_rebuilds_explicit_attach_payloads(self):
+        entry = build_resume_picker_entries([_flattened_codex_attach_session()])[0]
+
+        self.assertIsNotNone(entry.codex_attach)
+        assert entry.codex_attach is not None
+        self.assertEqual(entry.codex_attach.actionable_actions, ("resume", "fork"))
+        self.assertEqual(
+            entry.codex_attach.submission_payloads["resume"],
+            {
+                "agent": "codex",
+                "session_id": "thread_attach_123",
+                "codex_thread_id": "thread_attach_123",
+                "action_intent": "resume",
+            },
+        )
+        self.assertEqual(
+            entry.codex_attach.submission_payloads["fork"],
+            {
+                "agent": "codex",
+                "session_id": "thread_attach_123",
+                "codex_thread_id": "thread_attach_123",
+                "action_intent": "fork",
+            },
+        )
+
+    async def test_slack_static_select_session_selection_updates_modal_for_rehydrated_codex_attach(self):
+        bot = _SlackHarness.__new__(_SlackHarness)
+        session = _flattened_codex_attach_session()
+        entry = build_resume_picker_entries([session])[0]
+        bot.settings_manager = None
+        bot._controller = SimpleNamespace(
+            native_session_service=SimpleNamespace(get_session=lambda working_path, agent, session_id: session)
+        )
+        web_client = SimpleNamespace(views_update=AsyncMock())
+        bot.web_client = web_client
+
+        payload = {
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "actions": [
+                {
+                    "type": "static_select",
+                    "action_id": "session_select",
+                    "selected_option": {"value": entry.selection_value},
+                }
+            ],
+            "view": {
+                "id": "VIEW1",
+                "hash": "HASH1",
+                "callback_id": "resume_session_modal",
+                "private_metadata": json.dumps(
+                    {
+                        "channel_id": "C1",
+                        "thread_id": "TH1",
+                        "host_message_ts": "TS1",
+                        "working_path": "/tmp/worktree",
+                        "agent_options": [{"text": {"type": "plain_text", "text": "Codex"}, "value": "codex"}],
+                    }
+                ),
+                "state": {
+                    "values": {
+                        "manual_block": {"manual_input": {"value": ""}},
+                        "session_block": {"session_select": {"selected_option": {"value": entry.selection_value}}},
+                    }
+                },
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "session_block",
+                        "element": {
+                            "type": "static_select",
+                            "options": [
+                                {
+                                    "text": {"type": "plain_text", "text": entry.label, "emoji": True},
+                                    "value": entry.selection_value,
+                                    "description": {
+                                        "type": "plain_text",
+                                        "text": entry.description,
+                                        "emoji": True,
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        }
+
+        await bot._handle_interactive(payload)
+
+        web_client.views_update.assert_awaited_once()
+        updated_view = web_client.views_update.await_args_list[0].kwargs["view"]
+        action_block = next(block for block in updated_view["blocks"] if block.get("block_id") == "action_block")
+        self.assertEqual([option["value"] for option in action_block["element"]["options"]], ["resume", "fork"])
+        self.assertTrue(
+            any(
+                block.get("block_id") == "attach_preview_block"
+                and _TRANSLATIONS["modal.resume.codexInspectTitle"] in block["text"]["text"]
+                for block in updated_view["blocks"]
+            )
+        )
+
+    async def test_slack_preview_only_rehydrated_selection_fails_closed_on_submit(self):
+        bot = _SlackHarness.__new__(_SlackHarness)
+        preview_only_session = _flattened_codex_attach_session(allowed_actions=["inspect_only"])
+        bot._controller = SimpleNamespace(
+            native_session_service=SimpleNamespace(
+                get_session=lambda working_path, agent, session_id: preview_only_session
+            )
+        )
+        bot._on_resume_session = AsyncMock()
+        bot.send_message = AsyncMock()
+
+        payload = {
+            "type": "view_submission",
+            "user": {"id": "U1"},
+            "view": {
+                "callback_id": "resume_session_modal",
+                "state": {
+                    "values": {
+                        "agent_block": {"agent_select": {"selected_option": {"value": "codex"}}},
+                        "manual_block": {"manual_input": {"value": ""}},
+                        "session_block": {"session_select": {"selected_option": {"value": "codex|thread_attach_123"}}},
+                    }
+                },
+                "private_metadata": json.dumps(
+                    {
+                        "channel_id": "C1",
+                        "thread_id": "TH1",
+                        "host_message_ts": "TS1",
+                        "working_path": "/tmp/worktree",
+                    }
+                ),
+            },
+        }
+
+        await bot._handle_view_submission(payload)
+
+        bot._on_resume_session.assert_not_awaited()
+        bot.send_message.assert_awaited_once()
+        sent_text = bot.send_message.await_args_list[0].args[1]
+        self.assertIn(_TRANSLATIONS["modal.resume.codexUnsupportedHint"], sent_text)
 
     async def test_discord_attach_flow_exposes_explicit_resume_and_fork_actions(self):
         bot = _DiscordHarness.__new__(_DiscordHarness)

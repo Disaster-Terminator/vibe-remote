@@ -8,6 +8,19 @@ from modules.agents.native_sessions.types import NativeResumeSession
 
 
 _CODEX_ATTACH_ACTION_ORDER = ("resume", "fork")
+_CODEX_ATTACH_LOCATOR_KEYS = (
+    "allowed_actions",
+    "validation_status",
+    "workspace_match",
+    "materialized_history_available",
+    "materialized_history",
+    "codex_thread_id",
+    "thread_id",
+    "title",
+    "preview",
+    "last_activity",
+    "last_activity_ts",
+)
 
 
 def _normalize_codex_attach_actions(raw_actions: Any) -> tuple[str, ...]:
@@ -64,12 +77,11 @@ class ResumePickerEntry:
 
 
 def build_codex_attach_presentation(item: NativeResumeSession) -> Optional[CodexAttachPresentation]:
-    locator = item.locator if isinstance(item.locator, dict) else {}
-    attach_payload = locator.get("codex_attach")
-    if item.agent != "codex" or not isinstance(attach_payload, dict):
+    payload = _resolve_codex_attach_payload(item)
+    if payload is None:
         return None
 
-    payload = dict(attach_payload)
+    locator = item.locator if isinstance(item.locator, dict) else {}
     codex_thread_id = str(
         payload.get("codex_thread_id")
         or payload.get("thread_id")
@@ -103,6 +115,67 @@ def build_codex_attach_presentation(item: NativeResumeSession) -> Optional[Codex
         submission_payloads=submission_payloads,
         inspect_first=bool(payload.get("inspect_first", True)),
     )
+
+
+def _resolve_codex_attach_payload(item: NativeResumeSession) -> Optional[dict[str, Any]]:
+    if item.agent != "codex":
+        return None
+
+    locator = item.locator if isinstance(item.locator, dict) else {}
+    attach_payload = locator.get("codex_attach")
+    payload = dict(attach_payload) if isinstance(attach_payload, dict) else {}
+    for key in _CODEX_ATTACH_LOCATOR_KEYS:
+        if key not in payload and key in locator:
+            payload[key] = locator[key]
+
+    raw_submission_payloads = payload.get("submission_payloads")
+    allowed_actions = _normalize_codex_attach_actions(payload.get("allowed_actions"))
+    if not allowed_actions and isinstance(raw_submission_payloads, dict):
+        allowed_actions = tuple(
+            action for action in _CODEX_ATTACH_ACTION_ORDER if isinstance(raw_submission_payloads.get(action), dict)
+        )
+
+    if not payload and not allowed_actions:
+        return None
+
+    codex_thread_id = str(
+        payload.get("codex_thread_id")
+        or payload.get("thread_id")
+        or item.native_session_id
+    ).strip()
+    if not codex_thread_id:
+        return None
+
+    payload["codex_thread_id"] = codex_thread_id
+    payload["allowed_actions"] = allowed_actions
+    payload["inspect_first"] = bool(payload.get("inspect_first", True))
+
+    submission_payloads: dict[str, dict[str, str]] = {}
+    for action in _CODEX_ATTACH_ACTION_ORDER:
+        normalized_payload: dict[str, str] = {}
+        if isinstance(raw_submission_payloads, dict):
+            raw_payload = raw_submission_payloads.get(action)
+            if isinstance(raw_payload, dict):
+                normalized_payload = {str(key): str(value) for key, value in raw_payload.items() if value is not None}
+
+        if not normalized_payload and action in allowed_actions:
+            normalized_payload = {
+                "agent": item.agent,
+                "session_id": item.native_session_id,
+                "codex_thread_id": codex_thread_id,
+                "action_intent": action,
+            }
+        elif normalized_payload:
+            normalized_payload.setdefault("agent", item.agent)
+            normalized_payload.setdefault("session_id", item.native_session_id)
+            normalized_payload.setdefault("codex_thread_id", codex_thread_id)
+            normalized_payload.setdefault("action_intent", action)
+
+        if normalized_payload:
+            submission_payloads[action] = normalized_payload
+
+    payload["submission_payloads"] = submission_payloads
+    return payload
 
 
 def build_resume_picker_entries(sessions: list[NativeResumeSession]) -> list[ResumePickerEntry]:
