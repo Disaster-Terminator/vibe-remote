@@ -2829,7 +2829,7 @@ class SlackBot(BaseIMClient):
 
         if selected_attach is not None:
             blocks.append({"type": "divider"})
-            summary_text = "\n".join(build_codex_attach_summary_lines(selected_attach))
+            summary_text = "\n".join(build_codex_attach_summary_lines(selected_attach, t=lambda key: self._t(key)))
             blocks.append(
                 {
                     "type": "section",

@@ -1065,7 +1065,7 @@ class TelegramBot(BaseIMClient):
             attach = entry.codex_attach
             summary_lines = [f"🔎 {self._t('modal.resume.codexInspectTitle')}"]
             if attach is not None:
-                summary_lines.extend(build_codex_attach_summary_lines(attach))
+                summary_lines.extend(build_codex_attach_summary_lines(attach, t=lambda key: self._t(key)))
                 if attach.is_actionable:
                     summary_lines.append("")
                     summary_lines.append(self._t("modal.resume.codexInspectPrompt"))
