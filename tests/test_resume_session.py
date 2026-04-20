@@ -457,6 +457,53 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("forked-thread-2", im_client.messages[0][2])
         self.assertIn("external-thread-2", im_client.messages[0][2])
 
+    async def test_codex_external_attach_fork_confirmation_preview_uses_effective_session_id(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService(
+            [
+                _codex_attach_session(thread_id="external-thread-preview", allowed_actions=["resume", "fork"]),
+                NativeResumeSession(
+                    agent="codex",
+                    agent_prefix="cx",
+                    native_session_id="forked-thread-preview",
+                    working_path="/Users/cyh/vibe-remote",
+                    created_at=None,
+                    updated_at=None,
+                    sort_ts=101.0,
+                    last_agent_message="Forked thread preview should appear in confirmation.",
+                    last_agent_tail="...forked preview",
+                ),
+            ]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            fork_result=_codex_attach_result(
+                thread_id="forked-thread-preview",
+                attach_mode="fork",
+                source_thread_id="external-thread-preview",
+            ),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-preview",
+            action_intent="fork",
+            codex_thread_id="external-thread-preview",
+        )
+
+        self.assertIn("forked-thread-preview", im_client.messages[0][2])
+        self.assertIn("Forked thread preview should appear in confirmation.", im_client.messages[0][2])
+        self.assertNotIn("Inspect this external Codex thread before binding.", im_client.messages[0][2])
+
     async def test_codex_external_attach_validation_failure_mutates_nothing(self):
         settings = _StubSettingsManager()
         im_client = _StubIMClient()
