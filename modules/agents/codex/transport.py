@@ -51,7 +51,7 @@ class CodexTransport:
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, *, timeout_seconds: float | None = None) -> None:
         """Launch the app-server and perform the ``initialize`` handshake."""
         if self._process and self._process.returncode is None:
             logger.warning("CodexTransport.start() called but process is already running")
@@ -89,6 +89,7 @@ class CodexTransport:
                         "version": "1.0.0",
                     },
                 },
+                timeout_seconds=timeout_seconds,
             )
             logger.info("Codex app-server initialized: %s", resp)
             await self.send_notification("initialized")
@@ -176,7 +177,13 @@ class CodexTransport:
     # Sending
     # ------------------------------------------------------------------
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
         """Send a JSON-RPC request and return the result (blocking)."""
         self._request_id += 1
         req_id = self._request_id
@@ -194,11 +201,12 @@ class CodexTransport:
                 fut.set_exception(ConnectionError(f"Failed to send {method}"))
             raise
 
+        effective_timeout = 120.0 if timeout_seconds is None else max(float(timeout_seconds), 0.01)
         try:
-            return await asyncio.wait_for(fut, timeout=120.0)
+            return await asyncio.wait_for(fut, timeout=effective_timeout)
         except asyncio.TimeoutError:
             self._pending.pop(req_id, None)
-            raise TimeoutError(f"Codex RPC {method} (id={req_id}) timed out after 120s")
+            raise TimeoutError(f"Codex RPC {method} (id={req_id}) timed out after {effective_timeout:g}s")
 
     async def send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
         """Send a JSON-RPC notification (fire-and-forget)."""

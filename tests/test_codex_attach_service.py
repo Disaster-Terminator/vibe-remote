@@ -45,7 +45,11 @@ class TestCodexAttachService(unittest.IsolatedAsyncioTestCase):
             service = CodexAttachService(provide_transport)
             result = await service.list_threads(str(alias))
 
-            transport.send_request.assert_awaited_once_with("thread/list", {"cwd": str(repo.resolve())})
+            transport.send_request.assert_awaited_once_with(
+                "thread/list",
+                {"cwd": str(repo.resolve())},
+                timeout_seconds=None,
+            )
             self.assertEqual(result.next_cursor, "cursor-2")
             self.assertEqual(result.threads[0].thread_id, "thread-1")
             self.assertEqual(result.threads[0].workspace_validation.status, "valid")

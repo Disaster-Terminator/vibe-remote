@@ -83,13 +83,19 @@ class CodexAttachService:
     def __init__(self, transport_provider: TransportProvider) -> None:
         self._transport_provider = transport_provider
 
-    async def list_threads(self, cwd: str, params: Optional[dict[str, Any]] = None) -> CodexThreadListResult:
+    async def list_threads(
+        self,
+        cwd: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> CodexThreadListResult:
         requested_workspace = self._normalize_workspace(cwd)
         request_params = dict(params or {})
         request_params.setdefault("cwd", requested_workspace.realpath)
 
         transport = await self._transport_provider(cwd)
-        raw_result = await transport.send_request("thread/list", request_params)
+        raw_result = await transport.send_request("thread/list", request_params, timeout_seconds=timeout_seconds)
 
         items = raw_result.get("data")
         if not isinstance(items, list):

@@ -276,7 +276,7 @@ def test_codex_attach_provider_emits_attach_aware_metadata(tmp_path: Path) -> No
 
     items = asyncio.run(_collect())
 
-    attach_service.list_threads.assert_awaited_once_with(str(working_path))
+    attach_service.list_threads.assert_awaited_once_with(str(working_path), timeout_seconds=5.0)
     assert [item.native_session_id for item in items] == ["thread-1"]
     assert items[0].locator["thread_id"] == "thread-1"
     assert items[0].locator["title"] == "Investigate flaky test"
@@ -307,7 +307,7 @@ def test_codex_attach_fallback_when_attach_service_unavailable(tmp_path: Path) -
 
     items = provider.list_metadata(working_path)
 
-    attach_service.list_threads.assert_awaited_once_with(working_path)
+    attach_service.list_threads.assert_awaited_once_with(working_path, timeout_seconds=5.0)
     assert [item.native_session_id for item in items] == ["thread-sqlite"]
     assert items[0].locator["attach_source"] == "sqlite_fallback"
     assert items[0].locator["attach_service_available"] is False
@@ -470,6 +470,25 @@ def test_codex_attach_provider_marks_unverifiable_candidates_inspect_only(tmp_pa
     assert items[0].locator["workspace_match"] is False
     assert items[0].locator["workspace_realpath"] == ""
     assert items[0].locator["allowed_actions"] == ["inspect_only"]
+
+
+def test_codex_attach_provider_uses_short_catalog_timeout_for_listing(tmp_path: Path) -> None:
+    working_path = tmp_path / "repo"
+    working_path.mkdir()
+    (working_path / ".git").mkdir()
+    attach_service = SimpleNamespace(
+        list_threads=AsyncMock(side_effect=TimeoutError("timed out"))
+    )
+    provider = CodexNativeSessionProvider(
+        db_path=str(tmp_path / "missing.sqlite"),
+        attach_service=cast(Any, attach_service),
+        attach_catalog_timeout_seconds=0.05,
+    )
+
+    items = provider.list_metadata(str(working_path))
+
+    attach_service.list_threads.assert_awaited_once_with(str(working_path), timeout_seconds=0.05)
+    assert items == []
 
 
 def test_native_session_service_preserves_agent_visibility_when_limited() -> None:

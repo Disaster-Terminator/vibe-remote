@@ -27,10 +27,12 @@ class CodexNativeSessionProvider(NativeSessionProvider):
         *,
         attach_service: CodexAttachService | None = None,
         codex_binary: str | None = None,
+        attach_catalog_timeout_seconds: float = 5.0,
     ):
         self.db_path = Path(db_path or Path.home() / ".codex" / "state_5.sqlite")
         self._attach_service = attach_service
         self._codex_binary = codex_binary or os.getenv("CODEX_CLI_PATH") or "codex"
+        self._attach_catalog_timeout_seconds = attach_catalog_timeout_seconds
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -90,7 +92,10 @@ class CodexNativeSessionProvider(NativeSessionProvider):
         try:
             result = self._run_attach_operation_sync(
                 working_path,
-                lambda service: service.list_threads(working_path),
+                lambda service: service.list_threads(
+                    working_path,
+                    timeout_seconds=self._attach_catalog_timeout_seconds,
+                ),
             )
         except Exception as exc:
             logger.info("Codex attach catalog unavailable for %s, falling back to sqlite: %s", working_path, exc)
@@ -209,7 +214,7 @@ class CodexNativeSessionProvider(NativeSessionProvider):
             if transport is not None and transport.is_initialized:
                 return transport
             transport = CodexTransport(binary=self._codex_binary, cwd=cwd)
-            await transport.start()
+            await transport.start(timeout_seconds=self._attach_catalog_timeout_seconds)
             return transport
 
         service = CodexAttachService(_provide_transport)
