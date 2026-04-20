@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock
 
@@ -34,6 +35,21 @@ class _StubNativeSessionService:
 
     def list_recent_sessions(self, working_path: str, limit: int = 100):
         self.calls.append((working_path, limit))
+        return list(self.sessions)
+
+
+class _BlockingNativeSessionService(_StubNativeSessionService):
+    def __init__(self, sessions=None, *, delay_seconds: float = 0.15):
+        super().__init__(sessions=sessions)
+        self.delay_seconds = delay_seconds
+
+    def list_recent_sessions(self, working_path: str, limit: int = 100):
+        self.calls.append((working_path, limit))
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(asyncio.sleep(self.delay_seconds))
+        finally:
+            loop.close()
         return list(self.sessions)
 
 
@@ -223,6 +239,31 @@ class ResumeCommandCodexAttachTests(unittest.IsolatedAsyncioTestCase):
                 "action_intent": "fork",
             },
         )
+
+    async def test_resume_offloads_native_session_listing_without_blocking_event_loop(self):
+        controller = _StubController(platform="slack", sessions=[])
+        controller.native_session_service = _BlockingNativeSessionService(
+            [_codex_attach_session()],
+            delay_seconds=0.15,
+        )
+        context = self._context_for_platform("slack")
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        resume_task = asyncio.create_task(controller.command_handler.handle_resume(context))
+
+        await asyncio.sleep(0.01)
+
+        elapsed = loop.time() - start
+        self.assertLess(elapsed, 0.08)
+        self.assertFalse(resume_task.done())
+
+        await resume_task
+
+        self.assertEqual(controller.native_session_service.calls, [("/Users/cyh/vibe-remote", 100)])
+        self.assertEqual(len(controller.im_client.resume_calls), 1)
+        _, sessions, _, _, _, _ = controller.im_client.resume_calls[0]
+        self._assert_codex_attach_payload(sessions[0])
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
 """Command handlers for bot commands like /start, /new, /cwd, etc."""
 
+import asyncio
 from dataclasses import replace
 import logging
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Optional, cast
 from modules.agents import get_agent_display_name
 from modules.agents.native_sessions.types import NativeResumeSession
 from modules.agents.base import AgentRequest
@@ -139,13 +140,21 @@ class CommandHandlers(BaseHandler):
         list_recent_sessions = getattr(native_session_service, "list_recent_sessions", None)
         if native_session_service is None or not callable(list_recent_sessions):
             return working_path, []
-        sessions = list_recent_sessions(working_path, limit=limit)
+        sessions = cast(list[NativeResumeSession], list_recent_sessions(working_path, limit=limit))
         agent_service = getattr(self.controller, "agent_service", None)
         registered_agents = getattr(agent_service, "agents", None)
         if isinstance(registered_agents, dict) and registered_agents:
             allowed_agents = set(registered_agents.keys())
             sessions = [item for item in sessions if item.agent in allowed_agents]
         return working_path, sessions
+
+    async def _list_recent_native_sessions_async(
+        self,
+        context: MessageContext,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, list[NativeResumeSession]]:
+        return await asyncio.to_thread(self._list_recent_native_sessions, context, limit=limit)
 
     @staticmethod
     def _normalize_codex_attach_actions(raw_actions: Any) -> list[str]:
@@ -238,6 +247,14 @@ class CommandHandlers(BaseHandler):
             picker_sessions.append(replace(item, locator=locator))
         return working_path, picker_sessions
 
+    async def _build_resume_picker_sessions_async(
+        self,
+        context: MessageContext,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, list[NativeResumeSession]]:
+        return await asyncio.to_thread(self._build_resume_picker_sessions, context, limit=limit)
+
     @staticmethod
     def _format_resume_time(item: NativeResumeSession) -> str:
         dt = item.updated_at or item.created_at
@@ -280,7 +297,7 @@ class CommandHandlers(BaseHandler):
 
     async def _send_wechat_resume_page(self, context: MessageContext, *, page: int) -> None:
         page_size = self._wechat_resume_page_size
-        working_path, sessions = self._list_recent_native_sessions(context, limit=100)
+        working_path, sessions = await self._list_recent_native_sessions_async(context, limit=100)
         channel_context = self._get_channel_context(context)
         if not sessions:
             await self._get_im_client(channel_context).send_message(
@@ -380,7 +397,7 @@ class CommandHandlers(BaseHandler):
         )
 
     async def _handle_wechat_resume_latest(self, context: MessageContext, *, agent: Optional[str] = None) -> None:
-        _, sessions = self._list_recent_native_sessions(context, limit=100)
+        _, sessions = await self._list_recent_native_sessions_async(context, limit=100)
         if agent:
             sessions = [item for item in sessions if item.agent == agent]
         if not sessions:
@@ -834,7 +851,7 @@ class CommandHandlers(BaseHandler):
             interaction = context.platform_specific.get("interaction") if context.platform_specific else None
             if interaction and hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    working_path, sessions = self._build_resume_picker_sessions(context, limit=25)
+                    working_path, sessions = await self._build_resume_picker_sessions_async(context, limit=25)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=interaction,
@@ -854,7 +871,7 @@ class CommandHandlers(BaseHandler):
         if platform == "telegram":
             if hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    working_path, sessions = self._build_resume_picker_sessions(context, limit=25)
+                    working_path, sessions = await self._build_resume_picker_sessions_async(context, limit=25)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=context,
@@ -877,7 +894,7 @@ class CommandHandlers(BaseHandler):
         if platform == "lark":
             if hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    working_path, sessions = self._build_resume_picker_sessions(context, limit=100)
+                    working_path, sessions = await self._build_resume_picker_sessions_async(context, limit=100)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=context,
@@ -909,7 +926,7 @@ class CommandHandlers(BaseHandler):
             return
 
         try:
-            working_path, sessions = self._build_resume_picker_sessions(context, limit=100)
+            working_path, sessions = await self._build_resume_picker_sessions_async(context, limit=100)
             await im_client.run_on_client_loop(
                 im_client.open_resume_session_modal(
                     trigger_id=trigger_id,
