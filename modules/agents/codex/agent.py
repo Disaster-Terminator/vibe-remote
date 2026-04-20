@@ -208,11 +208,13 @@ class CodexAgent(BaseAgent):
 
     async def clear_sessions(self, session_key: str) -> int:
         """Clear sessions scoped to a specific session_key."""
-        self.sessions.clear_agent_sessions(session_key, self.name)
-
         # Use session_key index (not _threads) so sessions with
         # invalidated threads are still cleaned up properly.
         to_clear = self._session_mgr.get_sessions_by_session_key(session_key)
+
+        self.sessions.clear_agent_sessions(session_key, self.name)
+        for base_session_id in to_clear:
+            self.sessions.clear_codex_external_attachment(session_key, base_session_id)
 
         count = self._session_mgr.clear_by_session_key(session_key)
 

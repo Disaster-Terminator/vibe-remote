@@ -4,10 +4,15 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from config import paths
+from config.v2_sessions import SessionsStore
+from modules.sessions_facade import SessionsFacade
 
 _AGENT_PATH = Path(__file__).resolve().parents[1] / "modules/agents/codex/agent.py"
 
@@ -670,6 +675,103 @@ class _ApprovalUIStub:
 
     async def _clear(self, base_session_id: str):
         self.pending.pop(base_session_id, None)
+
+
+class CodexAgentClearSessionsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clear_sessions_removes_external_attachment_provenance(self):
+        with TemporaryDirectory() as tmpdir:
+            with patch.object(paths, "get_vibe_remote_dir", return_value=Path(tmpdir) / ".vibe_remote"):
+                sessions = SessionsFacade(SessionsStore())
+                sessions.set_agent_session_mapping("slack::C1", "codex", "session-1", "external-thread-1")
+                sessions.upsert_codex_external_attachment(
+                    "slack::C1",
+                    "session-1",
+                    binding_origin="external_attached",
+                    codex_thread_id="external-thread-1",
+                    attach_mode="resume",
+                    workspace_realpath="/tmp/work",
+                    workspace_repo_root=None,
+                    workspace_fingerprint="cwd:/tmp/work",
+                    forked_from_thread_id=None,
+                    attached_at="2026-01-01T00:00:00Z",
+                    last_validated_at="2026-01-01T00:00:00Z",
+                    validation_status="valid",
+                )
+
+                agent = object.__new__(CodexAgent)
+                session_mgr = RealCodexSessionManager()
+                session_mgr.set_session_key("session-1", "slack::C1")
+                session_mgr.set_cwd("session-1", "/tmp/work")
+                session_mgr.set_thread_id("session-1", "external-thread-1")
+                agent._session_mgr = session_mgr
+                agent._turn_registry = SimpleNamespace(clear_session=Mock())
+                agent._session_locks = {"session-1": asyncio.Lock()}
+                approval_ui = SimpleNamespace(clear=AsyncMock())
+                agent._approval_ui = approval_ui
+                agent.sessions = sessions
+                agent.name = "codex"
+
+                cleared = await agent.clear_sessions("slack::C1")
+
+                self.assertEqual(cleared, 1)
+                self.assertIsNone(sessions.get_codex_external_attachment("slack::C1", "session-1"))
+                self.assertEqual(sessions.find_codex_external_attachments_by_thread_id("external-thread-1"), [])
+                self.assertIsNone(sessions.get_agent_session_id("slack::C1", "session-1", "codex"))
+                agent._turn_registry.clear_session.assert_called_once_with("session-1")
+                approval_ui.clear.assert_awaited_once_with("session-1")
+
+    async def test_start_or_resume_after_clear_ignores_stale_external_attachment_state(self):
+        with TemporaryDirectory() as tmpdir:
+            with patch.object(paths, "get_vibe_remote_dir", return_value=Path(tmpdir) / ".vibe_remote"):
+                sessions = SessionsFacade(SessionsStore())
+                sessions.set_agent_session_mapping("slack::C1", "codex", "session-1", "external-thread-1")
+                sessions.upsert_codex_external_attachment(
+                    "slack::C1",
+                    "session-1",
+                    binding_origin="external_attached",
+                    codex_thread_id="external-thread-1",
+                    attach_mode="resume",
+                    workspace_realpath="/tmp/work",
+                    workspace_repo_root=None,
+                    workspace_fingerprint="cwd:/tmp/work",
+                    forked_from_thread_id=None,
+                    attached_at="2026-01-01T00:00:00Z",
+                    last_validated_at="2026-01-01T00:00:00Z",
+                    validation_status="valid",
+                )
+
+                agent = object.__new__(CodexAgent)
+                session_mgr = RealCodexSessionManager()
+                session_mgr.set_session_key("session-1", "slack::C1")
+                session_mgr.set_cwd("session-1", "/tmp/work")
+                session_mgr.set_thread_id("session-1", "external-thread-1")
+                agent._session_mgr = session_mgr
+                agent._turn_registry = SimpleNamespace(clear_session=Mock())
+                agent._session_locks = {"session-1": asyncio.Lock()}
+                agent._approval_ui = SimpleNamespace(clear=AsyncMock())
+                agent.sessions = sessions
+                agent.name = "codex"
+
+                await agent.clear_sessions("slack::C1")
+
+                request = SimpleNamespace(
+                    session_key="slack::C1",
+                    base_session_id="session-1",
+                    working_path="/tmp/work",
+                )
+                transport = SimpleNamespace()
+                agent._attach_service = SimpleNamespace(resume_thread=AsyncMock())
+                agent._get_or_create_transport = AsyncMock(return_value=transport)
+                agent._start_thread = AsyncMock(return_value="new-thread-1")
+                agent._resume_external_thread = AsyncMock(return_value="should-not-be-used")
+
+                thread_id = await agent._start_or_resume_thread(request)
+
+                self.assertEqual(thread_id, "new-thread-1")
+                agent._resume_external_thread.assert_not_awaited()
+                agent._attach_service.resume_thread.assert_not_awaited()
+                agent._get_or_create_transport.assert_awaited_once_with("/tmp/work")
+                agent._start_thread.assert_awaited_once_with(transport, request)
 
 
 class CodexAgentHandleMessageTests(unittest.IsolatedAsyncioTestCase):
