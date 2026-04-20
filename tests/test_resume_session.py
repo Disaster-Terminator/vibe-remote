@@ -226,6 +226,21 @@ def _codex_attach_session(
     )
 
 
+def _codex_local_session(*, session_id: str, preview: str = "Local Codex session preview."):
+    return NativeResumeSession(
+        agent="codex",
+        agent_prefix="cx",
+        native_session_id=session_id,
+        working_path="/Users/cyh/vibe-remote",
+        created_at=None,
+        updated_at=None,
+        sort_ts=95.0,
+        last_agent_message=preview,
+        last_agent_tail="...local codex",
+        locator={"title": "Local Codex Session"},
+    )
+
+
 class _StubCodexAttachService:
     def __init__(self, *, validation, resume_result=None, fork_result=None):
         self.validation = validation
@@ -299,6 +314,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         im_client = _StubIMClient()
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_dm")])
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U999",
@@ -321,6 +337,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig())
         ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_abc")])
         codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock())
         ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
 
@@ -337,6 +354,62 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
             session_key="slack::C111",
             working_path="/Users/cyh/vibe-remote",
         )
+
+    async def test_codex_manual_unresolved_plain_session_id_fails_closed(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock())
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="unresolved-manual-id",
+        )
+
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(settings.codex_attachment_upserts, [])
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("interactive inspect + Resume/Fork flow", im_client.messages[0][2])
+
+    async def test_codex_manual_unresolved_attach_submission_fails_closed(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            resume_result=_codex_attach_result(thread_id="should-not-run", attach_mode="resume"),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="unresolved-manual-id",
+            action_intent="resume",
+            codex_thread_id="unresolved-manual-id",
+        )
+
+        attach_service.resume_thread.assert_not_awaited()
+        attach_service.fork_thread.assert_not_awaited()
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(settings.codex_attachment_upserts, [])
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("interactive inspect + Resume/Fork flow", im_client.messages[0][2])
 
     async def test_handle_resume_session_submission_prepares_claude_binding(self):
         settings = _StubSettingsManager()
@@ -782,6 +855,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig(platform="discord"))
         ctrl.im_client.should_use_thread_for_dm_session = lambda: False
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_dm")])
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U999",
@@ -822,6 +896,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig(platform="discord"))
         ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_sub")])
         im_client.prepared_context = MessageContext(
             user_id="U777",
             channel_id="C777",
@@ -856,6 +931,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl.init_minimal(im_client, settings, _StubConfig(platform="telegram"))
         ctrl.im_client.should_use_thread_for_reply = lambda: True
         ctrl.im_client.should_use_message_id_for_channel_session = lambda context=None: False
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_telegram_group")])
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U777",
@@ -885,6 +961,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl.init_minimal(im_client, settings, _StubConfig(platform="telegram"))
         ctrl.im_client.should_use_thread_for_reply = lambda: True
         ctrl.im_client.should_use_message_id_for_channel_session = lambda context=None: False
+        ctrl.native_session_service = _StubNativeSessionService([_codex_local_session(session_id="sess_telegram_topic")])
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U777",

@@ -393,12 +393,14 @@ class SessionHandler(BaseHandler):
         codex_thread_id: Optional[str],
     ) -> Optional[dict[str, Any]]:
         item = self._get_native_session_item(context, agent="codex", session_id=session_id)
+        if item is None:
+            return None
         locator = dict(item.locator) if item and isinstance(item.locator, dict) else {}
         attach_payload = locator.get("codex_attach")
         attach_data = dict(attach_payload) if isinstance(attach_payload, dict) else dict(locator)
         explicit_action = self._normalize_codex_attach_action(action_intent)
 
-        if not self._is_codex_attach_candidate(locator, explicit_action_intent=explicit_action):
+        if not self._is_codex_attach_candidate(locator, explicit_action_intent=None):
             return None
 
         requested_thread_id = str(
@@ -433,15 +435,17 @@ class SessionHandler(BaseHandler):
         action_intent: Optional[str],
         codex_thread_id: Optional[str],
     ) -> None:
-        if action_intent or codex_thread_id:
-            return
-
         item = self._get_native_session_item(context, agent="codex", session_id=session_id)
         if item is None:
-            return
+            raise ValueError(self._t("error.codexAttachManualSessionRequiresPicker"))
 
         locator = dict(item.locator) if isinstance(item.locator, dict) else {}
-        if self._is_codex_attach_candidate(locator, explicit_action_intent=None):
+        is_attach_candidate = self._is_codex_attach_candidate(locator, explicit_action_intent=None)
+        if action_intent or codex_thread_id:
+            if not is_attach_candidate:
+                raise ValueError(self._t("error.codexAttachManualSessionRequiresPicker"))
+            return
+        if is_attach_candidate:
             raise ValueError(self._t("error.codexAttachManualSessionRequiresPicker"))
 
     def _build_codex_attach_provenance(self, *, attach_mode: str, thread_id: str, source_thread_id: Optional[str]) -> str:
