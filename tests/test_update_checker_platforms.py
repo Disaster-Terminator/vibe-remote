@@ -89,3 +89,72 @@ def test_fetch_pypi_version_sync_ignores_prerelease_for_stable_current(monkeypat
         info = update_checker._fetch_pypi_version_sync()
 
     assert info == {"current": "2.2.7", "latest": "2.2.7", "has_update": False, "error": None}
+
+
+def test_is_dev_or_source_build_detects_dev_and_local_versions():
+    assert update_checker._is_dev_or_source_build("0.1.dev944+g8abe5eecf") is True
+    assert update_checker._is_dev_or_source_build("2.2.12+local") is True
+    assert update_checker._is_dev_or_source_build("2.2.12") is False
+
+
+def test_do_check_skips_auto_update_for_dev_build(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    SettingsStore.reset_instance()
+
+    async def run_test():
+        checker = UpdateChecker(_StubController(SettingsStore.get_instance()), UpdateConfig(auto_update=True, notify_admins=False))
+        checker.state.last_activity_at = 0
+        monkeypatch.setattr(checker, "_is_idle", lambda: True)
+
+        async def fail_perform_update(_latest: str):
+            raise AssertionError("auto-update should be skipped for dev/source builds")
+
+        monkeypatch.setattr(checker, "_perform_update", fail_perform_update)
+        monkeypatch.setattr(
+            update_checker,
+            "_fetch_pypi_version_sync",
+            lambda: {
+                "current": "0.1.dev944+g8abe5eecf",
+                "latest": "2.2.12",
+                "has_update": True,
+                "error": None,
+            },
+        )
+
+        await checker._do_check()
+        assert checker.state.last_check_at is not None
+        assert checker.state.notified_version is None
+
+    asyncio.run(run_test())
+
+
+def test_do_check_still_auto_updates_stable_build(monkeypatch, tmp_path):
+    monkeypatch.setenv("VIBE_REMOTE_HOME", str(tmp_path))
+    SettingsStore.reset_instance()
+
+    async def run_test():
+        checker = UpdateChecker(_StubController(SettingsStore.get_instance()), UpdateConfig(auto_update=True, notify_admins=False))
+        checker.state.last_activity_at = 0
+        monkeypatch.setattr(checker, "_is_idle", lambda: True)
+
+        seen = {}
+
+        async def capture_perform_update(latest: str):
+            seen["latest"] = latest
+
+        monkeypatch.setattr(checker, "_perform_update", capture_perform_update)
+        monkeypatch.setattr(
+            update_checker,
+            "_fetch_pypi_version_sync",
+            lambda: {
+                "current": "2.2.11",
+                "latest": "2.2.12",
+                "has_update": True,
+                "error": None,
+            },
+        )
+
+        await checker._do_check()
+        assert seen["latest"] == "2.2.12"
+
+    asyncio.run(run_test())

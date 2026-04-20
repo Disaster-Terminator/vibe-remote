@@ -40,6 +40,11 @@ MIN_CHECK_INTERVAL_MINUTES = 1
 NOTIFICATION_GRACE_PERIOD_MINUTES = 10
 
 
+def _is_dev_or_source_build(version: str) -> bool:
+    normalized = (version or "").strip()
+    return ".dev" in normalized or "+" in normalized
+
+
 def _fetch_pypi_version_sync() -> Dict[str, Any]:
     """Synchronous PyPI version fetch (to be run in thread)."""
     from vibe import __version__
@@ -251,7 +256,9 @@ class UpdateChecker:
             # Auto-update flow — respect a grace period after successful notification
             # so the admin has time to read the notification before auto-update kicks in.
             if self.config.auto_update and self._is_idle():
-                if self._within_notification_grace_period(latest):
+                if _is_dev_or_source_build(current):
+                    logger.info("Skipping auto-update for dev/source build: %s", current)
+                elif self._within_notification_grace_period(latest):
                     logger.info("Within notification grace period, deferring auto-update")
                 else:
                     logger.info("System is idle, performing auto-update...")
