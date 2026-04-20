@@ -13,7 +13,8 @@ from typing import Any, Callable, Dict, Optional
 from config.discovered_chats import DiscoveredChatsStore
 from config.v2_config import TelegramConfig
 from vibe.i18n import get_supported_languages, t as i18n_t
-from modules.agents.native_sessions import AgentNativeSessionService, NativeResumeSession
+from modules.agents.native_sessions import NativeResumeSession
+from .resume_picker import ResumePickerEntry, build_codex_attach_summary_lines, build_resume_picker_entries
 
 from .base import BaseIMClient, FileAttachment, MessageContext, InlineButton, InlineKeyboard
 from .formatters import TelegramFormatter
@@ -31,8 +32,9 @@ class _TelegramCwdPrompt:
 @dataclass
 class _TelegramResumeSessionState:
     message_id: str
-    options: list[tuple[str, str]]
+    entries: list[ResumePickerEntry]
     is_dm: bool
+    selected_index: Optional[int] = None
 
 
 @dataclass
@@ -1038,38 +1040,57 @@ class TelegramBot(BaseIMClient):
         channel_id: str,
         thread_id: Optional[str],
         host_message_ts: Optional[str],
+        working_path: Optional[str] = None,
     ):
+        del channel_id, thread_id, host_message_ts, working_path
         context = trigger_id if isinstance(trigger_id, MessageContext) else None
         if context is None:
             raise ValueError("Telegram resume flow requires a message context")
 
-        options: list[tuple[str, str]] = []
+        entries = build_resume_picker_entries(list(sessions)[:12])
+        state = _TelegramResumeSessionState(
+            message_id="",
+            entries=entries,
+            is_dm=bool((context.platform_specific or {}).get("is_dm")),
+        )
+        text, keyboard = self._render_resume_state(state)
+        message_id = await self.send_message_with_buttons(context, text, keyboard)
+        state.message_id = message_id
+        self._resume_states[self._interaction_scope_key(context)] = state
+
+    def _render_resume_state(self, state: _TelegramResumeSessionState) -> tuple[str, InlineKeyboard]:
         rows: list[list[InlineButton]] = []
+        if state.selected_index is not None:
+            entry = state.entries[state.selected_index]
+            attach = entry.codex_attach
+            summary_lines = [f"🔎 {self._t('modal.resume.codexInspectTitle')}"]
+            if attach is not None:
+                summary_lines.extend(build_codex_attach_summary_lines(attach))
+                if attach.is_actionable:
+                    summary_lines.append("")
+                    summary_lines.append(self._t("modal.resume.codexInspectPrompt"))
+                    for action in attach.actionable_actions:
+                        label = self._t("common.resume") if action == "resume" else self._t("common.fork")
+                        rows.append([InlineButton(text=label[:40], callback_data=f"tg_resume:action:{action}")])
+                else:
+                    summary_lines.append("")
+                    summary_lines.append(f"ℹ️ {self._t('modal.resume.codexUnsupportedHint')}")
+            rows.append([InlineButton(text=self._t("common.back")[:40], callback_data="tg_resume:back")])
+            rows.append([InlineButton(text=f"✖️ {self._t('common.cancel')}"[:40], callback_data="tg_resume:cancel")])
+            return "\n".join(summary_lines), InlineKeyboard(buttons=rows)
+
         summary_lines = [
             f"⏮️ {self._t('telegram.resumeTitle')}",
             self._t("telegram.resumeBody"),
         ]
-        for item in list(sessions)[:12]:
-            idx = len(options)
-            options.append((item.agent, item.native_session_id))
-            label = AgentNativeSessionService.format_display_summary(item)
-            rows.append([InlineButton(text=label[:40], callback_data=f"tg_resume:{idx}")])
-            summary_lines.append(
-                f"{idx + 1}. {label} ({AgentNativeSessionService.format_display_time(item)})"
-            )
-            if len(options) >= 12:
-                break
-
-        rows.append([InlineButton(text=f"✖️ {self._t('common.cancel')}", callback_data="tg_resume:cancel")])
+        for idx, entry in enumerate(state.entries):
+            rows.append([InlineButton(text=entry.label[:40], callback_data=f"tg_resume:select:{idx}")])
+            summary_lines.append(f"{idx + 1}. {entry.label} ({entry.description})")
+        rows.append([InlineButton(text=f"✖️ {self._t('common.cancel')}"[:40], callback_data="tg_resume:cancel")])
         text = "\n".join(summary_lines)
-        if not options:
+        if not state.entries:
             text += f"\n\nℹ️ {self._t('telegram.resumeNoStoredSessions')}"
-        message_id = await self.send_message_with_buttons(context, text, InlineKeyboard(buttons=rows))
-        self._resume_states[self._interaction_scope_key(context)] = _TelegramResumeSessionState(
-            message_id=message_id,
-            options=options,
-            is_dm=bool((context.platform_specific or {}).get("is_dm")),
-        )
+        return text, InlineKeyboard(buttons=rows)
 
     async def _handle_resume_callback(self, context: MessageContext, callback_data: str) -> None:
         scope_key = self._interaction_scope_key(context)
@@ -1081,14 +1102,57 @@ class TelegramBot(BaseIMClient):
             await self._delete_interaction_message(context, state.message_id)
             return
 
-        try:
-            option_index = int(callback_data.split(":", 1)[1])
-        except Exception:
-            return
-        if option_index < 0 or option_index >= len(state.options):
+        if callback_data == "tg_resume:back":
+            state.selected_index = None
+            text, keyboard = self._render_resume_state(state)
+            await self.edit_message(context, state.message_id, text=text, keyboard=keyboard)
             return
 
-        agent, session_id = state.options[option_index]
+        if callback_data.startswith("tg_resume:action:"):
+            if state.selected_index is None:
+                return
+            entry = state.entries[state.selected_index]
+            attach = entry.codex_attach
+            if attach is None:
+                return
+            action = callback_data.split(":", 2)[2]
+            payload = attach.submission_payloads.get(action)
+            if not isinstance(payload, dict):
+                return
+            self._resume_states.pop(scope_key, None)
+            await self._delete_interaction_message(context, state.message_id)
+            if self._controller is None or not hasattr(self._controller, "session_handler"):
+                await self.send_message(context, f"❌ {self._t('error.resumeFailed')}")
+                return
+            await self._controller.session_handler.handle_resume_session_submission(
+                user_id=context.user_id,
+                channel_id=context.channel_id,
+                thread_id=context.thread_id,
+                agent=payload.get("agent") or entry.item.agent,
+                session_id=payload.get("session_id") or entry.item.native_session_id,
+                is_dm=state.is_dm,
+                platform="telegram",
+                action_intent=payload.get("action_intent"),
+                codex_thread_id=payload.get("codex_thread_id"),
+            )
+            return
+
+        try:
+            prefix, action_name, raw_index = callback_data.split(":", 2)
+            del prefix, action_name
+            option_index = int(raw_index)
+        except Exception:
+            return
+        if option_index < 0 or option_index >= len(state.entries):
+            return
+
+        entry = state.entries[option_index]
+        if entry.codex_attach is not None:
+            state.selected_index = option_index
+            text, keyboard = self._render_resume_state(state)
+            await self.edit_message(context, state.message_id, text=text, keyboard=keyboard)
+            return
+
         self._resume_states.pop(scope_key, None)
         if self._controller is None or not hasattr(self._controller, "session_handler"):
             await self.send_message(context, f"❌ {self._t('error.resumeFailed')}")
@@ -1098,8 +1162,8 @@ class TelegramBot(BaseIMClient):
             user_id=context.user_id,
             channel_id=context.channel_id,
             thread_id=context.thread_id,
-            agent=agent,
-            session_id=session_id,
+            agent=entry.item.agent,
+            session_id=entry.item.native_session_id,
             is_dm=state.is_dm,
             platform="telegram",
         )

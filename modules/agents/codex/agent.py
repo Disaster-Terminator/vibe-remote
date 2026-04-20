@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from modules.agents.base import AgentRequest, BaseAgent
+from modules.agents.codex.attach_service import CodexAttachService
 from modules.agents.subagent_router import SubagentDefinition, load_codex_subagent
 from modules.agents.codex.event_handler import CodexEventHandler
-from modules.agents.codex.session import CodexSessionManager
+from modules.agents.codex.session import CodexPendingApproval, CodexSessionManager
 from modules.agents.codex.transport import CodexTransport
 from modules.agents.codex.turn_state import CodexTurnRegistry
+from modules.agents.question_ui import PendingQuestion, Question, QuestionOption, QuestionUIHandler
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,13 @@ class CodexAgent(BaseAgent):
         self._session_mgr = CodexSessionManager()
         self._turn_registry = CodexTurnRegistry()
         self._event_handler = CodexEventHandler(self)
+        self._attach_service = CodexAttachService(self._get_or_create_transport)
+        self._approval_ui = QuestionUIHandler(
+            controller=controller,
+            im_client=self.im_client,
+            settings_manager=self.settings_manager,
+            callback_prefix="codex_approval",
+        )
 
         # base_session_id → asyncio.Lock (serialize turn lifecycle per session)
         self._session_locks: Dict[str, asyncio.Lock] = {}
@@ -57,6 +68,10 @@ class CodexAgent(BaseAgent):
         3. If a turn is active → interrupt it first
         4. Start a new turn with the user's message
         """
+        if str(getattr(request, "message", "") or "").startswith("codex_approval:"):
+            await self._handle_approval_response(request)
+            return
+
         try:
             transport = await self._get_or_create_transport(request.working_path)
         except FileNotFoundError:
@@ -95,7 +110,7 @@ class CodexAgent(BaseAgent):
                 thread_id = self._session_mgr.get_thread_id(request.base_session_id)
 
                 if not thread_id:
-                    thread_id = await self._start_or_resume_thread(transport, request)
+                    thread_id = await self._start_or_resume_thread(request)
 
                 # If a turn is active, interrupt it first
                 active_turn = self._turn_registry.get_active_turn(request.base_session_id)
@@ -138,7 +153,7 @@ class CodexAgent(BaseAgent):
                         request.base_session_id,
                     )
                     try:
-                        thread_id = await self._start_or_resume_thread(transport, request)
+                        thread_id = await self._start_or_resume_thread(request)
                         await self._start_turn(transport, request, thread_id)
                         return  # retry succeeded
                     except Exception as retry_err:
@@ -205,6 +220,9 @@ class CodexAgent(BaseAgent):
         for bid in to_clear:
             self._turn_registry.clear_session(bid)
             self._session_locks.pop(bid, None)
+            approval_ui = getattr(self, "_approval_ui", None)
+            if approval_ui is not None:
+                await approval_ui.clear(bid)
 
         return count
 
@@ -225,6 +243,9 @@ class CodexAgent(BaseAgent):
         for base_session_id in self._session_mgr.all_base_sessions():
             self._session_mgr.invalidate_thread(base_session_id)
             self._turn_registry.clear_session(base_session_id)
+            approval_ui = getattr(self, "_approval_ui", None)
+            if approval_ui is not None:
+                await approval_ui.clear(base_session_id)
 
         logger.info("Refreshed Codex auth state across %d transport(s)", len(transports))
 
@@ -288,6 +309,9 @@ class CodexAgent(BaseAgent):
                 self.sessions.clear_agent_session_mapping(session_key, self.name, base_session_id)
             self._session_mgr.clear(base_session_id)
             self._turn_registry.clear_session(base_session_id)
+            approval_ui = getattr(self, "_approval_ui", None)
+            if approval_ui is not None:
+                await approval_ui.clear(base_session_id)
 
         self._session_locks.clear()
         logger.info("Stopped Codex runtime across %d transport(s)", len(transports))
@@ -452,6 +476,8 @@ class CodexAgent(BaseAgent):
         if not thread_id:
             raise RuntimeError("Codex thread/start returned no thread id")
 
+        if hasattr(self._session_mgr, "set_lineage"):
+            self._session_mgr.set_lineage(request.base_session_id, binding_origin="vibe_created", attach_mode="start")
         self._session_mgr.set_thread_id(request.base_session_id, thread_id)
         # Also persist for resume support
         self.sessions.set_agent_session_mapping(
@@ -482,12 +508,13 @@ class CodexAgent(BaseAgent):
                     context_settings_manager = None
                 if context_settings_manager is not None:
                     used_context_settings_manager = True
-                    channel_settings = context_settings_manager.get_channel_settings(settings_key)
-                    routing = channel_settings.routing if channel_settings else None
+                    get_channel_settings = getattr(context_settings_manager, "get_channel_settings", None)
+                    channel_settings = get_channel_settings(settings_key) if callable(get_channel_settings) else None
+                    routing = getattr(channel_settings, "routing", None) if channel_settings else None
 
         if routing is None and not used_context_settings_manager:
             channel_settings = self.settings_manager.get_channel_settings(settings_key)
-            routing = channel_settings.routing if channel_settings else None
+            routing = getattr(channel_settings, "routing", None) if channel_settings else None
 
         request_subagent = getattr(request, "subagent_name", None)
         request_model = getattr(request, "subagent_model", None)
@@ -516,36 +543,188 @@ class CodexAgent(BaseAgent):
 
     async def _start_or_resume_thread(
         self,
-        transport: CodexTransport,
         request: AgentRequest,
     ) -> str:
         """Try to resume a persisted thread, fall back to creating a new one."""
-        # Check if we have a persisted Codex thread_id from settings_manager
+        attachment = self.sessions.get_codex_external_attachment(
+            request.session_key,
+            request.base_session_id,
+        )
         persisted = self.sessions.get_agent_session_id(
             request.session_key,
             request.base_session_id,
             self.name,
         )
+
+        if attachment and getattr(attachment, "binding_origin", "") == "external_attached":
+            return await self._resume_external_thread(request, attachment, persisted)
+
         if persisted:
             try:
-                resp = await transport.send_request(
-                    "thread/resume",
-                    {"threadId": persisted},
+                resume_result = await self._attach_service.resume_thread(
+                    request.working_path,
+                    persisted,
                 )
-                # thread/resume returns Thread directly OR may nest under "thread"
-                thread_id = resp.get("id", "")
-                if not thread_id:
-                    thread_obj = resp.get("thread")
-                    if isinstance(thread_obj, dict):
-                        thread_id = thread_obj.get("id", "")
+                thread_id = resume_result.thread_id
                 if thread_id:
+                    if hasattr(self._session_mgr, "set_lineage"):
+                        self._session_mgr.set_lineage(
+                            request.base_session_id,
+                            binding_origin="vibe_created",
+                            attach_mode="resume",
+                        )
                     self._session_mgr.set_thread_id(request.base_session_id, thread_id)
                     logger.info("Resumed Codex thread %s for session %s", thread_id, request.base_session_id)
                     return thread_id
             except Exception as e:
                 logger.warning("Failed to resume Codex thread %s: %s, starting new", persisted, e)
 
+        transport = await self._get_or_create_transport(request.working_path)
         return await self._start_thread(transport, request)
+
+    async def _resume_external_thread(
+        self,
+        request: AgentRequest,
+        attachment: Any,
+        persisted_thread_id: Optional[str],
+    ) -> str:
+        target_thread_id = str(persisted_thread_id or getattr(attachment, "codex_thread_id", "") or "")
+        if not target_thread_id:
+            raise RuntimeError("Codex external attachment is missing a resumable thread id")
+
+        validation = self._attach_service.validate_workspace(
+            request.working_path,
+            expected_realpath=getattr(attachment, "workspace_realpath", None),
+            expected_repo_root=getattr(attachment, "workspace_repo_root", None),
+            expected_fingerprint=getattr(attachment, "workspace_fingerprint", None),
+        )
+        if not validation.is_valid:
+            raise RuntimeError(f"Codex external attachment validation failed: {validation.message}")
+
+        duplicate_binding = self._find_live_duplicate_external_attachment(
+            request,
+            target_thread_id,
+        )
+
+        attach_mode = str(getattr(attachment, "attach_mode", "") or "resume")
+        source_thread_id = str(
+            getattr(attachment, "forked_from_thread_id", None)
+            or getattr(attachment, "codex_thread_id", None)
+            or target_thread_id
+        )
+
+        self._session_mgr.begin_external_attach(
+            request.base_session_id,
+            target_thread_id,
+            attach_mode=attach_mode,
+            external_thread_id=source_thread_id,
+            forked_from_thread_id=getattr(attachment, "forked_from_thread_id", None),
+        )
+
+        try:
+            if duplicate_binding is not None:
+                if attach_mode != "resume" or getattr(attachment, "forked_from_thread_id", None):
+                    raise RuntimeError(
+                        "Codex external thread is already attached to another live session; refusing to share writers."
+                    )
+
+                fork_result = await self._attach_service.fork_thread(request.working_path, target_thread_id)
+                await self._bind_external_thread_result(
+                    request,
+                    result=fork_result,
+                    prior_attachment=attachment,
+                    attach_mode="fork",
+                    source_thread_id=source_thread_id,
+                    forked_from_thread_id=target_thread_id,
+                )
+                logger.info(
+                    "Forked duplicate Codex external attach %s -> %s for session %s",
+                    target_thread_id,
+                    fork_result.thread_id,
+                    request.base_session_id,
+                )
+                return fork_result.thread_id
+
+            resume_result = await self._attach_service.resume_thread(request.working_path, target_thread_id)
+            await self._bind_external_thread_result(
+                request,
+                result=resume_result,
+                prior_attachment=attachment,
+                attach_mode=attach_mode,
+                source_thread_id=source_thread_id,
+                forked_from_thread_id=getattr(attachment, "forked_from_thread_id", None),
+            )
+            logger.info(
+                "Resumed Codex external thread %s for session %s",
+                resume_result.thread_id,
+                request.base_session_id,
+            )
+            return resume_result.thread_id
+        except Exception:
+            self._session_mgr.clear_pending_attach(request.base_session_id)
+            raise
+
+    async def _bind_external_thread_result(
+        self,
+        request: AgentRequest,
+        *,
+        result: Any,
+        prior_attachment: Any,
+        attach_mode: str,
+        source_thread_id: str,
+        forked_from_thread_id: Optional[str],
+    ) -> None:
+        if not result.workspace_validation.is_valid:
+            raise RuntimeError(f"Codex external attachment validation failed: {result.workspace_validation.message}")
+
+        requested_workspace = result.attach_metadata.requested_workspace
+        resolved_thread_id = result.thread_id
+        self._session_mgr.set_lineage(
+            request.base_session_id,
+            binding_origin="external_attached",
+            attach_mode=attach_mode,
+            external_thread_id=source_thread_id,
+            forked_from_thread_id=forked_from_thread_id,
+        )
+        self._session_mgr.complete_external_attach(request.base_session_id, resolved_thread_id)
+
+        self.sessions.set_agent_session_mapping(
+            request.session_key,
+            self.name,
+            request.base_session_id,
+            resolved_thread_id,
+        )
+        timestamp = self._utc_timestamp()
+        self.sessions.upsert_codex_external_attachment(
+            request.session_key,
+            request.base_session_id,
+            binding_origin="external_attached",
+            codex_thread_id=resolved_thread_id,
+            attach_mode=attach_mode,
+            workspace_realpath=requested_workspace.realpath,
+            workspace_repo_root=requested_workspace.repo_root,
+            workspace_fingerprint=requested_workspace.workspace_fingerprint,
+            forked_from_thread_id=forked_from_thread_id,
+            attached_at=getattr(prior_attachment, "attached_at", None) or timestamp,
+            last_validated_at=timestamp,
+            validation_status=result.workspace_validation.status,
+        )
+
+    def _find_live_duplicate_external_attachment(
+        self,
+        request: AgentRequest,
+        codex_thread_id: str,
+    ) -> Optional[Any]:
+        for binding in self.sessions.find_codex_external_attachments_by_thread_id(codex_thread_id):
+            if binding.session_key == request.session_key and binding.base_session_id == request.base_session_id:
+                continue
+            if self._session_mgr.is_session_live(binding.base_session_id):
+                return binding
+
+        live_owner = self._session_mgr.find_base_session_id_for_thread(codex_thread_id)
+        if live_owner and live_owner != request.base_session_id:
+            return live_owner
+        return None
 
     async def _start_turn(
         self,
@@ -654,16 +833,226 @@ class CodexAgent(BaseAgent):
         method: str,
         params: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Handle server requests — auto-approve all."""
+        """Handle server requests, surfacing resumed external approvals via IM."""
         if method in (
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
         ):
-            logger.info("Auto-approving Codex %s (item=%s)", method, params.get("itemId"))
-            return {"approved": True}
+            request = self._find_request_for_server_request(params)
+            if request is None:
+                logger.warning("Rejecting Codex approval with no request context: %s", params)
+                return {"approved": False}
+
+            lineage = self._session_mgr.get_lineage(request.base_session_id)
+            if not lineage or lineage.binding_origin != "external_attached":
+                logger.info("Auto-approving Codex %s (item=%s)", method, params.get("itemId"))
+                return {"approved": True}
+
+            return await self._handle_external_approval_request(req_id, method, params, request)
 
         logger.warning("Unknown Codex server request: %s", method)
-        return {"approved": True}
+        return {"approved": False}
+
+    async def _handle_external_approval_request(
+        self,
+        req_id: int | str,
+        method: str,
+        params: Dict[str, Any],
+        request: AgentRequest,
+    ) -> Dict[str, Any]:
+        base_session_id = request.base_session_id
+        pending_approval = self._session_mgr.get_pending_approval(base_session_id)
+        if pending_approval is not None:
+            await self._fail_pending_approval(
+                base_session_id,
+                request,
+                reason="Conflicting Codex approval request detected on the resumed external thread.",
+            )
+            return {"approved": False}
+
+        thread_id = self._extract_thread_id(params)
+        turn_id = self._extract_turn_id(params)
+        item_id = str(params.get("itemId", "") or "")
+
+        approval = CodexPendingApproval(
+            request_id=req_id,
+            method=method,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            item_id=item_id,
+        )
+        pending_question = self._build_approval_question(request, method, params)
+        self._session_mgr.set_pending_approval(base_session_id, approval)
+        self._approval_ui.set_pending(base_session_id, pending_question)
+
+        try:
+            prompt_message_id = await self._approval_ui.render_question_ui(request, pending_question)
+            pending_question.prompt_message_id = prompt_message_id
+            self._session_mgr.update_pending_approval_prompt_message(base_session_id, prompt_message_id)
+            if not prompt_message_id:
+                await self._fail_pending_approval(
+                    base_session_id,
+                    request,
+                    reason="Codex approval UI could not be rendered on this platform.",
+                    notify=False,
+                )
+                return {"approved": False}
+
+            answered = await self._approval_ui.wait_for_answer(request, pending_question)
+            final_state = self._session_mgr.get_pending_approval(base_session_id)
+            if not answered or final_state is None:
+                return {"approved": False}
+            if final_state.status not in {"approved", "denied"}:
+                return {"approved": False}
+            return {"approved": bool(final_state.decision)}
+        finally:
+            self._session_mgr.pop_pending_approval(base_session_id)
+            await self._approval_ui.clear(base_session_id)
+
+    def _build_approval_question(
+        self,
+        request: AgentRequest,
+        method: str,
+        params: Dict[str, Any],
+    ) -> PendingQuestion:
+        item_kind = "command" if "commandExecution" in method else "file change"
+        command = str(params.get("command", "") or "").strip()
+        changes = params.get("changes")
+        change_count = len(changes) if isinstance(changes, list) else 0
+
+        lines = [f"Resumed Codex thread requires approval for a pending {item_kind} request."]
+        if command:
+            lines.append(f"Command: `{command}`")
+        if change_count:
+            lines.append(f"Changed files: {change_count}")
+        item_id = str(params.get("itemId", "") or "")
+        if item_id:
+            lines.append(f"Request ID: `{item_id}`")
+
+        prompt_text = "\n".join(lines)
+        questions = [
+            Question(
+                header="Codex approval required",
+                question=prompt_text,
+                options=[
+                    QuestionOption(label="Approve", description="Allow Codex to continue this resumed thread."),
+                    QuestionOption(label="Deny", description="Reject the pending approval request."),
+                ],
+            )
+        ]
+        return PendingQuestion(
+            questions=questions,
+            prompt_text=self._approval_ui.build_prompt_text(questions),
+            option_labels=["Approve", "Deny"],
+            base_session_id=request.base_session_id,
+            thread_id=request.context.thread_id,
+            agent_data={"kind": "codex_approval"},
+        )
+
+    async def _handle_approval_response(self, request: AgentRequest) -> None:
+        pending = self._approval_ui.get_pending(request.base_session_id)
+        approval = self._session_mgr.get_pending_approval(request.base_session_id)
+        if pending is None or approval is None or approval.status != "pending":
+            await self.controller.emit_agent_message(
+                request.context,
+                "notify",
+                "❌ This Codex approval prompt is stale and was rejected.",
+            )
+            return
+
+        if request.message == "codex_approval:open_modal":
+            await self._approval_ui.open_modal(request, pending)
+            return
+
+        pending_message_id = pending.prompt_message_id or approval.prompt_message_id
+        callback_message_id = getattr(request.context, "message_id", None)
+        if pending_message_id and callback_message_id and pending_message_id != callback_message_id:
+            await self.controller.emit_agent_message(
+                request.context,
+                "notify",
+                "❌ This Codex approval prompt is stale and was rejected.",
+            )
+            return
+
+        selected_label = self._parse_approval_answer(request.message)
+        if selected_label is None:
+            await self.controller.emit_agent_message(
+                request.context,
+                "notify",
+                "❌ Please choose Approve or Deny for the Codex request.",
+            )
+            return
+
+        approval.decision = selected_label == "Approve"
+        approval.status = "approved" if approval.decision else "denied"
+        await self._approval_ui.update_prompt_after_answer(request, pending)
+        await self._approval_ui.send_answer_receipt(request, [[selected_label]])
+        self._approval_ui.signal_answer_received(request.base_session_id)
+
+    def _parse_approval_answer(self, message: str) -> Optional[str]:
+        if message.startswith("codex_approval:choose:"):
+            try:
+                option_index = int(message.rsplit(":", 1)[-1])
+            except Exception:
+                return None
+            if option_index == 1:
+                return "Approve"
+            if option_index == 2:
+                return "Deny"
+            return None
+
+        if message.startswith("codex_approval:modal:"):
+            try:
+                payload = json.loads(message.split(":", 2)[-1])
+            except Exception:
+                return None
+            answers = payload.get("answers") if isinstance(payload, dict) else payload
+            if isinstance(answers, list) and answers:
+                first = answers[0]
+                if isinstance(first, list) and first:
+                    choice = str(first[0]).strip()
+                else:
+                    choice = str(first).strip()
+                if choice in {"Approve", "Deny"}:
+                    return choice
+        return None
+
+    async def _fail_pending_approval(
+        self,
+        base_session_id: str,
+        request: AgentRequest,
+        *,
+        reason: str,
+        notify: bool = True,
+    ) -> None:
+        approval = self._session_mgr.get_pending_approval(base_session_id)
+        if approval is None:
+            return
+
+        approval.decision = False
+        approval.status = "conflict"
+        pending = self._approval_ui.get_pending(base_session_id)
+        im_client: Any = self._get_im_client(request.context)
+        if pending and pending.prompt_message_id and hasattr(im_client, "remove_inline_keyboard"):
+            try:
+                await im_client.remove_inline_keyboard(
+                    request.context,
+                    pending.prompt_message_id,
+                    text=pending.prompt_text,
+                    parse_mode="markdown",
+                )
+            except Exception:
+                logger.debug("Failed to remove stale Codex approval UI", exc_info=True)
+
+        if notify:
+            await self.controller.emit_agent_message(request.context, "notify", f"❌ {reason}")
+        self._approval_ui.signal_answer_received(base_session_id)
+
+    async def _expire_pending_approval_for_turn(self, turn_id: str, request: AgentRequest, *, reason: str) -> None:
+        base_session_id = self._session_mgr.find_base_session_id_for_pending_approval_turn(turn_id)
+        if not base_session_id:
+            return
+        await self._fail_pending_approval(base_session_id, request, reason=reason, notify=False)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -675,6 +1064,18 @@ class CodexAgent(BaseAgent):
         if not base_session_id:
             return None
         return self._turn_registry.get_latest_request(base_session_id)
+
+    def _find_request_for_server_request(self, params: Dict[str, Any]) -> Optional[AgentRequest]:
+        turn_id = self._extract_turn_id(params)
+        if turn_id:
+            request = self._turn_registry.get_request_for_turn(turn_id)
+            if request:
+                return request
+
+        thread_id = self._extract_thread_id(params)
+        if thread_id:
+            return self._find_request_for_thread(thread_id)
+        return None
 
     def _find_request_for_notification(self, method: str, params: Dict[str, Any]) -> Optional[AgentRequest]:
         turn_id = self._extract_turn_id(params)
@@ -723,6 +1124,10 @@ class CodexAgent(BaseAgent):
             if isinstance(turn_obj, dict):
                 turn_id = turn_obj.get("id", "")
         return turn_id
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
     async def _delete_ack(self, request: AgentRequest) -> None:
         ack_id = request.ack_message_id

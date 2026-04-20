@@ -29,8 +29,8 @@ from modules.agents.opencode.utils import (
     resolve_opencode_allowed_providers,
     resolve_opencode_provider_preferences,
 )
-from modules.agents.native_sessions.display import format_display_summary, format_display_time
 from modules.agents.native_sessions.types import NativeResumeSession
+from .resume_picker import ResumePickerEntry, build_codex_attach_summary_lines, build_resume_picker_entries
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,8 @@ class FeishuBot(BaseIMClient):
         self._on_resume_session: Optional[Callable] = None
         # Cache for two-step routing flow (channel_id:user_id -> kwargs from settings_handler)
         self._routing_cache: Dict[str, Dict[str, Any]] = {}
+        self._resume_picker_cache: Dict[str, Dict[str, ResumePickerEntry]] = {}
+        self._resume_attach_cache: Dict[str, Dict[str, Any]] = {}
         self._stop_event: Optional[asyncio.Event] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._recent_event_ids: Dict[str, float] = {}
@@ -1753,6 +1755,10 @@ class FeishuBot(BaseIMClient):
             if not callback_data:
                 return
 
+            if callback_data.startswith("resume_attach:"):
+                await self._handle_resume_attach_callback(context, callback_data)
+                return
+
             # Route all callbacks through the generic handler, which sends
             # them to message_handler.handle_callback_query for proper routing.
             if self.on_callback_query_callback:
@@ -2071,6 +2077,8 @@ class FeishuBot(BaseIMClient):
         parts = button_name.split(":")
         embedded_thread_id = parts[1] if len(parts) > 1 and parts[1] else None
         host_message_ts = parts[2] if len(parts) > 2 and parts[2] else None
+        working_path = parts[3] if len(parts) > 3 and parts[3] else None
+        del working_path
 
         # Restore thread_id on context if available from embedded metadata
         if embedded_thread_id and not context.thread_id:
@@ -2116,6 +2124,20 @@ class FeishuBot(BaseIMClient):
             await self.send_message(context, f"⚠️ {t('modal.resume.description')}")
             return
 
+        if not manual_session_id and session_select:
+            cache_key = f"{context.channel_id}:{context.user_id}"
+            entry = (self._resume_picker_cache.get(cache_key) or {}).get(session_select)
+            attach = entry.codex_attach if entry is not None else None
+            if attach is not None:
+                await self._send_resume_attach_card(
+                    context,
+                    entry=entry,
+                    host_message_ts=host_message_ts,
+                    thread_id=context.thread_id,
+                    is_dm=context.platform_specific.get("is_dm", False) if context.platform_specific else False,
+                )
+                return
+
         # Delegate to the resume session callback (same as Slack/Discord)
         if hasattr(self, "_on_resume_session") and self._on_resume_session:
             is_dm = context.platform_specific.get("is_dm", False) if context.platform_specific else False
@@ -2127,6 +2149,80 @@ class FeishuBot(BaseIMClient):
                 chosen_session,
                 host_message_ts,
                 is_dm,
+            )
+
+    async def _send_resume_attach_card(
+        self,
+        context: MessageContext,
+        *,
+        entry: ResumePickerEntry,
+        host_message_ts: Optional[str],
+        thread_id: Optional[str],
+        is_dm: bool,
+    ) -> None:
+        attach = entry.codex_attach
+        if attach is None:
+            return
+
+        token = str(time.time_ns())
+        self._resume_attach_cache[token] = {
+            "user_id": context.user_id,
+            "channel_id": context.channel_id,
+            "thread_id": thread_id,
+            "host_message_ts": host_message_ts,
+            "is_dm": is_dm,
+            "agent": entry.item.agent,
+            "session_id": entry.item.native_session_id,
+            "submission_payloads": attach.submission_payloads,
+        }
+
+        lines = [f"🔎 {self._t('modal.resume.codexInspectTitle', context.channel_id)}"]
+        lines.extend(build_codex_attach_summary_lines(attach))
+        rows: list[list[InlineButton]] = []
+        if attach.is_actionable:
+            lines.append("")
+            lines.append(self._t("modal.resume.codexInspectPrompt", context.channel_id))
+            action_row: list[InlineButton] = []
+            for action in attach.actionable_actions:
+                label = self._t("common.resume", context.channel_id) if action == "resume" else self._t("common.fork", context.channel_id)
+                action_row.append(InlineButton(text=label, callback_data=f"resume_attach:{token}:{action}"))
+            rows.append(action_row)
+        else:
+            lines.append("")
+            lines.append(f"ℹ️ {self._t('modal.resume.codexUnsupportedHint', context.channel_id)}")
+        rows.append([InlineButton(text=self._t("common.cancel", context.channel_id), callback_data=f"resume_attach:{token}:cancel")])
+        await self.send_message_with_buttons(context, "\n".join(lines), InlineKeyboard(buttons=rows))
+
+    async def _handle_resume_attach_callback(self, context: MessageContext, callback_data: str) -> None:
+        parts = callback_data.split(":", 2)
+        if len(parts) != 3:
+            return
+        _, token, action = parts
+        cached = self._resume_attach_cache.get(token)
+        if not cached:
+            await self.send_message(context, f"ℹ️ {self._t('modal.resume.codexUnsupportedHint', context.channel_id)}")
+            return
+        if action == "cancel":
+            self._resume_attach_cache.pop(token, None)
+            return
+
+        payload = cached.get("submission_payloads", {}).get(action)
+        if not isinstance(payload, dict):
+            await self.send_message(context, f"ℹ️ {self._t('modal.resume.codexUnsupportedHint', context.channel_id)}")
+            return
+
+        self._resume_attach_cache.pop(token, None)
+        if hasattr(self, "_on_resume_session") and self._on_resume_session:
+            await self._on_resume_session(
+                cached.get("user_id") or context.user_id,
+                cached.get("channel_id") or context.channel_id,
+                cached.get("thread_id") or context.thread_id,
+                payload.get("agent") or cached.get("agent"),
+                payload.get("session_id") or cached.get("session_id"),
+                cached.get("host_message_ts"),
+                bool(cached.get("is_dm")),
+                action_intent=payload.get("action_intent"),
+                codex_thread_id=payload.get("codex_thread_id"),
             )
 
     # ------------------------------------------------------------------
@@ -2707,6 +2803,7 @@ class FeishuBot(BaseIMClient):
         channel_id: str = None,
         thread_id: str = None,
         host_message_ts: str = None,
+        working_path: Optional[str] = None,
         # Legacy compat — ignored; use sessions instead
         sessions: List[NativeResumeSession] | None = None,
         **kwargs,
@@ -2733,24 +2830,26 @@ class FeishuBot(BaseIMClient):
         for agent in sorted(allowed_agents):
             agent_options.append({"text": {"tag": "plain_text", "content": agent.capitalize()}, "value": agent})
 
+        entries = build_resume_picker_entries(sessions or [])
+        if isinstance(trigger_id, MessageContext):
+            cache_key = f"{channel_id}:{trigger_id.user_id}"
+            self._resume_picker_cache[cache_key] = {entry.selection_value: entry for entry in entries}
+
         # --- Build session options for select_static ---
         session_options = []
         total = 0
         max_options = 100
         if sessions:
-            for item in sessions:
+            for entry in entries:
                 if total >= max_options:
                     break
+                item = entry.item
                 if item.agent not in allowed_agents:
                     continue
-                label = (
-                    f"{format_display_summary(item)}"
-                    f" · {format_display_time(item)}"
-                )
                 session_options.append(
                     {
-                        "text": {"tag": "plain_text", "content": label[:120]},
-                        "value": f"{item.agent}|{item.native_session_id}",
+                        "text": {"tag": "plain_text", "content": f"{entry.label} · {entry.description}"[:120]},
+                        "value": entry.selection_value,
                     }
                 )
                 total += 1
@@ -2831,6 +2930,7 @@ class FeishuBot(BaseIMClient):
             "resume_submit",
             thread_id or "",
             host_message_ts or "",
+            working_path or "",
         ]
         submit_button_name = ":".join(meta_parts)
 

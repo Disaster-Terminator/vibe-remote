@@ -14,6 +14,9 @@ _AGENT_PATH = Path(__file__).resolve().parents[1] / "modules/agents/codex/agent.
 _modules_pkg = types.ModuleType("modules")
 _agents_pkg = types.ModuleType("modules.agents")
 _codex_pkg = types.ModuleType("modules.agents.codex")
+_modules_pkg.__path__ = [str(Path(__file__).resolve().parents[1] / "modules")]
+_agents_pkg.__path__ = [str(Path(__file__).resolve().parents[1] / "modules/agents")]
+_codex_pkg.__path__ = [str(Path(__file__).resolve().parents[1] / "modules/agents/codex")]
 
 _base_module = types.ModuleType("modules.agents.base")
 setattr(_base_module, "AgentRequest", object)
@@ -32,11 +35,74 @@ setattr(_event_handler_module, "CodexEventHandler", object)
 _session_module = types.ModuleType("modules.agents.codex.session")
 setattr(_session_module, "CodexSessionManager", object)
 
+
+class _StubCodexPendingApproval:
+    def __init__(
+        self,
+        request_id=None,
+        method="",
+        thread_id="",
+        turn_id="",
+        item_id="",
+        prompt_message_id=None,
+        status="pending",
+        decision=None,
+    ):
+        self.request_id = request_id
+        self.method = method
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.item_id = item_id
+        self.prompt_message_id = prompt_message_id
+        self.status = status
+        self.decision = decision
+
+
+setattr(_session_module, "CodexPendingApproval", _StubCodexPendingApproval)
+
 _transport_module = types.ModuleType("modules.agents.codex.transport")
 setattr(_transport_module, "CodexTransport", object)
 
 _turn_state_module = types.ModuleType("modules.agents.codex.turn_state")
 setattr(_turn_state_module, "CodexTurnRegistry", object)
+
+_question_ui_module = types.ModuleType("modules.agents.question_ui")
+
+
+class _StubQuestionOption:
+    def __init__(self, label=None, description=""):
+        self.label = label
+        self.description = description
+
+
+class _StubQuestion:
+    def __init__(self, question="", header="", options=None, multiple=False):
+        self.question = question
+        self.header = header
+        self.options = list(options or [])
+        self.multiple = multiple
+
+
+class _StubPendingQuestion:
+    def __init__(self, questions=None, prompt_text="", option_labels=None, base_session_id="", thread_id=None, agent_data=None):
+        self.questions = list(questions or [])
+        self.prompt_text = prompt_text
+        self.option_labels = list(option_labels or [])
+        self.base_session_id = base_session_id
+        self.thread_id = thread_id
+        self.agent_data = dict(agent_data or {})
+        self.prompt_message_id = None
+
+
+class _StubQuestionUIHandler:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+setattr(_question_ui_module, "QuestionOption", _StubQuestionOption)
+setattr(_question_ui_module, "Question", _StubQuestion)
+setattr(_question_ui_module, "PendingQuestion", _StubPendingQuestion)
+setattr(_question_ui_module, "QuestionUIHandler", _StubQuestionUIHandler)
 
 _subagent_router_module = types.ModuleType("modules.agents.subagent_router")
 
@@ -74,6 +140,7 @@ _STUBBED_MODULES = {
     "modules.agents.codex.session": _session_module,
     "modules.agents.codex.transport": _transport_module,
     "modules.agents.codex.turn_state": _turn_state_module,
+    "modules.agents.question_ui": _question_ui_module,
 }
 _saved_modules = {name: sys.modules.get(name) for name in _STUBBED_MODULES}
 
@@ -85,6 +152,15 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 CodexAgent = _MODULE.CodexAgent
+
+_SESSION_PATH = Path(__file__).resolve().parents[1] / "modules/agents/codex/session.py"
+_SESSION_SPEC = importlib.util.spec_from_file_location("test_codex_session_module", _SESSION_PATH)
+assert _SESSION_SPEC is not None and _SESSION_SPEC.loader is not None
+_SESSION_MODULE = importlib.util.module_from_spec(_SESSION_SPEC)
+sys.modules["test_codex_session_module"] = _SESSION_MODULE
+_SESSION_SPEC.loader.exec_module(_SESSION_MODULE)
+RealCodexSessionManager = _SESSION_MODULE.CodexSessionManager
+RealCodexPendingApproval = _SESSION_MODULE.CodexPendingApproval
 
 for name, module in _saved_modules.items():
     if module is None:
@@ -538,6 +614,64 @@ class _HandleMessageTurnRegistry:
         return False
 
 
+class _ExternalAttachTurnRegistry:
+    def __init__(self):
+        self.latest_requests = {}
+        self.turn_requests = {}
+
+    def remember_request(self, request):
+        self.latest_requests[request.base_session_id] = request
+
+    def get_latest_request(self, base_session_id: str):
+        return self.latest_requests.get(base_session_id)
+
+    def get_request_for_turn(self, turn_id: str):
+        return self.turn_requests.get(turn_id)
+
+    def get_active_turn(self, base_session_id: str):
+        return None
+
+    def has_pending_turn_start(self, base_session_id: str):
+        return False
+
+    def begin_turn_start(self, request, thread_id: str):
+        return None
+
+    def get_bootstrapped_turn_id(self, base_session_id: str, request):
+        return None
+
+    def finalize_turn_start_response(self, turn_id: str, request):
+        self.turn_requests[turn_id] = request
+        return SimpleNamespace(request=request)
+
+    def clear_pending_turn_start(self, base_session_id: str, request):
+        return None
+
+
+class _ApprovalUIStub:
+    def __init__(self):
+        self.pending = {}
+        self.render_question_ui = AsyncMock(return_value="approval-msg-1")
+        self.wait_for_answer = AsyncMock(return_value=True)
+        self.clear = AsyncMock(side_effect=self._clear)
+        self.update_prompt_after_answer = AsyncMock()
+        self.send_answer_receipt = AsyncMock()
+        self.open_modal = AsyncMock()
+        self.signal_answer_received = Mock(return_value=True)
+
+    def build_prompt_text(self, questions):
+        return "\n".join(getattr(question, "question", "") for question in questions)
+
+    def set_pending(self, base_session_id: str, pending):
+        self.pending[base_session_id] = pending
+
+    def get_pending(self, base_session_id: str):
+        return self.pending.get(base_session_id)
+
+    async def _clear(self, base_session_id: str):
+        self.pending.pop(base_session_id, None)
+
+
 class CodexAgentHandleMessageTests(unittest.IsolatedAsyncioTestCase):
     async def test_handle_message_does_not_hide_turn_before_interrupt_succeeds(self):
         agent = object.__new__(CodexAgent)
@@ -589,6 +723,312 @@ class CodexAgentHandleMessageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(resolved)
+
+
+class CodexAgentExternalAttachTests(unittest.IsolatedAsyncioTestCase):
+    async def test_external_attach_missing_resumable_thread_id_fails_closed(self):
+        agent = object.__new__(CodexAgent)
+        agent._session_mgr = RealCodexSessionManager()
+        agent._attach_service = SimpleNamespace(
+            validate_workspace=Mock(),
+            resume_thread=AsyncMock(),
+            fork_thread=AsyncMock(),
+        )
+
+        request = SimpleNamespace(base_session_id="session-1", session_key="slack::C1", working_path="/tmp/work")
+        attachment = SimpleNamespace(
+            binding_origin="external_attached",
+            codex_thread_id="",
+            attach_mode="resume",
+            workspace_realpath="/tmp/work",
+            workspace_repo_root=None,
+            workspace_fingerprint="cwd:/tmp/work",
+            forked_from_thread_id=None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing a resumable thread id"):
+            await agent._resume_external_thread(request, attachment, None)
+
+        agent._attach_service.validate_workspace.assert_not_called()
+        agent._attach_service.resume_thread.assert_not_awaited()
+        agent._attach_service.fork_thread.assert_not_awaited()
+        self.assertIsNone(agent._session_mgr.get_pending_attach_thread_id("session-1"))
+
+    async def test_external_attach_resume_preserves_notification_routing_and_starts_next_turn(self):
+        agent = object.__new__(CodexAgent)
+        session_mgr = RealCodexSessionManager()
+        turn_registry = _ExternalAttachTurnRegistry()
+        approval_ui = _ApprovalUIStub()
+
+        request = SimpleNamespace(
+            base_session_id="session-1",
+            composite_session_id="slack:C1:T1",
+            session_key="slack::C1",
+            working_path="/tmp/work",
+            message="continue",
+            context=SimpleNamespace(platform="slack", platform_specific={}, thread_id="thread-ts"),
+            ack_message_id=None,
+            started_at=0.0,
+            subagent_name=None,
+            subagent_model=None,
+            subagent_reasoning_effort=None,
+            files=None,
+        )
+
+        async def resume_thread(_cwd: str, thread_id: str):
+            self.assertEqual(thread_id, "external-thread-1")
+            self.assertIs(agent._find_request_for_thread("external-thread-1"), request)
+            return SimpleNamespace(
+                thread_id="external-thread-1",
+                workspace_validation=SimpleNamespace(is_valid=True, status="valid", message="ok"),
+                attach_metadata=SimpleNamespace(
+                    requested_workspace=SimpleNamespace(
+                        realpath="/tmp/work",
+                        repo_root=None,
+                        workspace_fingerprint="cwd:/tmp/work",
+                    )
+                ),
+            )
+
+        transport = SimpleNamespace(send_request=AsyncMock(return_value={"turn": {"id": "turn-1"}}))
+        agent._session_locks = {}
+        agent._turn_registry = turn_registry
+        agent._session_mgr = session_mgr
+        agent._approval_ui = approval_ui
+        agent._event_handler = SimpleNamespace(clear_pending=Mock(return_value=None))
+        agent._remove_ack_reaction = AsyncMock()
+        agent._delete_ack = AsyncMock()
+        agent._build_input = Mock(return_value=[{"type": "text", "text": "continue"}])
+        agent._touch_transport_activity = Mock()
+        agent._get_or_create_transport = AsyncMock(return_value=transport)
+        agent._attach_service = SimpleNamespace(
+            validate_workspace=Mock(return_value=SimpleNamespace(is_valid=True, status="valid", message="ok")),
+            resume_thread=AsyncMock(side_effect=resume_thread),
+            fork_thread=AsyncMock(),
+        )
+        agent.settings_manager = SimpleNamespace(get_channel_settings=lambda session_key: None)
+        agent.codex_config = SimpleNamespace(default_model=None)
+        agent.sessions = SimpleNamespace(
+            get_agent_session_id=Mock(return_value="external-thread-1"),
+            get_codex_external_attachment=Mock(
+                return_value=SimpleNamespace(
+                    binding_origin="external_attached",
+                    codex_thread_id="external-thread-1",
+                    attach_mode="resume",
+                    workspace_realpath="/tmp/work",
+                    workspace_repo_root=None,
+                    workspace_fingerprint="cwd:/tmp/work",
+                    forked_from_thread_id=None,
+                    attached_at="2026-01-01T00:00:00+00:00",
+                )
+            ),
+            find_codex_external_attachments_by_thread_id=Mock(return_value=[]),
+            set_agent_session_mapping=Mock(),
+            upsert_codex_external_attachment=Mock(),
+            clear_agent_session_mapping=Mock(),
+        )
+        agent.controller = SimpleNamespace(
+            emit_agent_message=AsyncMock(),
+            agent_auth_service=SimpleNamespace(maybe_emit_auth_recovery_message=AsyncMock(return_value=False)),
+            config=SimpleNamespace(platform="slack", reply_enhancements=False),
+        )
+
+        await agent.handle_message(request)
+
+        self.assertEqual(session_mgr.get_thread_id("session-1"), "external-thread-1")
+        self.assertEqual(session_mgr.get_lineage("session-1").binding_origin, "external_attached")
+        agent._attach_service.resume_thread.assert_awaited_once_with("/tmp/work", "external-thread-1")
+        transport.send_request.assert_awaited_once_with(
+            "turn/start",
+            {
+                "threadId": "external-thread-1",
+                "input": [{"type": "text", "text": "continue"}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            },
+        )
+
+    async def test_external_attach_duplicate_live_binding_forks_instead_of_sharing_writers(self):
+        agent = object.__new__(CodexAgent)
+        session_mgr = RealCodexSessionManager()
+        session_mgr.set_session_key("session-live", "slack::other")
+        session_mgr.set_cwd("session-live", "/tmp/work")
+        session_mgr.set_lineage(
+            "session-live",
+            binding_origin="external_attached",
+            attach_mode="resume",
+            external_thread_id="external-thread-1",
+        )
+        session_mgr.set_thread_id("session-live", "external-thread-1")
+        agent._session_mgr = session_mgr
+        agent._approval_ui = _ApprovalUIStub()
+        agent.sessions = SimpleNamespace(
+            find_codex_external_attachments_by_thread_id=Mock(
+                return_value=[SimpleNamespace(session_key="slack::other", base_session_id="session-live")]
+            ),
+            set_agent_session_mapping=Mock(),
+            upsert_codex_external_attachment=Mock(),
+        )
+        agent._attach_service = SimpleNamespace(
+            validate_workspace=Mock(return_value=SimpleNamespace(is_valid=True, status="valid", message="ok")),
+            fork_thread=AsyncMock(
+                return_value=SimpleNamespace(
+                    thread_id="fork-thread-2",
+                    workspace_validation=SimpleNamespace(is_valid=True, status="valid", message="ok"),
+                    attach_metadata=SimpleNamespace(
+                        requested_workspace=SimpleNamespace(
+                            realpath="/tmp/work",
+                            repo_root=None,
+                            workspace_fingerprint="cwd:/tmp/work",
+                        )
+                    ),
+                )
+            ),
+            resume_thread=AsyncMock(),
+        )
+
+        request = SimpleNamespace(base_session_id="session-1", session_key="slack::C1", working_path="/tmp/work")
+        attachment = SimpleNamespace(
+            binding_origin="external_attached",
+            codex_thread_id="external-thread-1",
+            attach_mode="resume",
+            workspace_realpath="/tmp/work",
+            workspace_repo_root=None,
+            workspace_fingerprint="cwd:/tmp/work",
+            forked_from_thread_id=None,
+            attached_at="2026-01-01T00:00:00+00:00",
+        )
+
+        thread_id = await agent._resume_external_thread(request, attachment, "external-thread-1")
+
+        self.assertEqual(thread_id, "fork-thread-2")
+        agent._attach_service.resume_thread.assert_not_awaited()
+        agent._attach_service.fork_thread.assert_awaited_once_with("/tmp/work", "external-thread-1")
+        self.assertEqual(session_mgr.get_thread_id("session-1"), "fork-thread-2")
+        lineage = session_mgr.get_lineage("session-1")
+        self.assertEqual(lineage.attach_mode, "fork")
+        self.assertEqual(lineage.external_thread_id, "external-thread-1")
+        agent.sessions.set_agent_session_mapping.assert_called_once_with(
+            "slack::C1",
+            "codex",
+            "session-1",
+            "fork-thread-2",
+        )
+        agent.sessions.upsert_codex_external_attachment.assert_called_once()
+        _, kwargs = agent.sessions.upsert_codex_external_attachment.call_args
+        self.assertEqual(kwargs["attach_mode"], "fork")
+        self.assertEqual(kwargs["forked_from_thread_id"], "external-thread-1")
+
+    async def test_external_attach_approval_handoff_surfaces_and_conflict_fails_closed(self):
+        agent = object.__new__(CodexAgent)
+        session_mgr = RealCodexSessionManager()
+        approval_ui = _ApprovalUIStub()
+        request = SimpleNamespace(
+            base_session_id="session-1",
+            context=SimpleNamespace(message_id="approval-msg-1", thread_id="im-thread", platform="slack", platform_specific={}),
+        )
+        session_mgr.set_lineage(
+            "session-1",
+            binding_origin="external_attached",
+            attach_mode="resume",
+            external_thread_id="external-thread-1",
+        )
+        session_mgr.set_thread_id("session-1", "external-thread-1")
+        agent._session_mgr = session_mgr
+        agent._approval_ui = approval_ui
+        agent.controller = SimpleNamespace(emit_agent_message=AsyncMock())
+        agent.im_client = SimpleNamespace(remove_inline_keyboard=AsyncMock())
+        agent._get_im_client = lambda context: agent.im_client
+
+        turn_registry = _ExternalAttachTurnRegistry()
+        turn_registry.latest_requests["session-1"] = request
+        agent._turn_registry = turn_registry
+
+        async def wait_for_answer(_request, _pending):
+            approval = session_mgr.get_pending_approval("session-1")
+            assert approval is not None
+            approval.decision = True
+            approval.status = "approved"
+            return True
+
+        approval_ui.wait_for_answer = AsyncMock(side_effect=wait_for_answer)
+
+        approval_result = await agent._on_server_request(
+            7,
+            "item/commandExecution/requestApproval",
+            {"threadId": "external-thread-1", "turnId": "turn-1", "itemId": "item-1", "command": "pytest"},
+        )
+
+        self.assertEqual(approval_result, {"approved": True})
+        approval_ui.render_question_ui.assert_awaited_once()
+        render_await = approval_ui.render_question_ui.await_args
+        assert render_await is not None
+        self.assertEqual(render_await.args[0], request)
+        rendered_pending = render_await.args[1]
+        self.assertIn("pending command request", rendered_pending.prompt_text)
+        self.assertEqual(session_mgr.get_pending_approval("session-1"), None)
+
+        session_mgr.set_pending_approval(
+            "session-1",
+            RealCodexPendingApproval(request_id=8, method="item/commandExecution/requestApproval", thread_id="external-thread-1", turn_id="turn-2", item_id="item-2"),
+        )
+        approval_ui.set_pending("session-1", SimpleNamespace(prompt_message_id="approval-msg-2", prompt_text="Approve?"))
+
+        conflict_result = await agent._on_server_request(
+            9,
+            "item/fileChange/requestApproval",
+            {"threadId": "external-thread-1", "turnId": "turn-3", "itemId": "item-3"},
+        )
+
+        self.assertEqual(conflict_result, {"approved": False})
+        self.assertEqual(session_mgr.get_pending_approval("session-1").status, "conflict")
+        approval_ui.signal_answer_received.assert_called_once_with("session-1")
+
+    async def test_external_attach_stale_approval_response_is_rejected(self):
+        agent = object.__new__(CodexAgent)
+        session_mgr = RealCodexSessionManager()
+        approval_ui = _ApprovalUIStub()
+        request = SimpleNamespace(
+            base_session_id="session-1",
+            message="codex_approval:choose:1",
+            context=SimpleNamespace(
+                message_id="approval-msg-stale",
+                thread_id="im-thread",
+                platform="slack",
+                platform_specific={},
+            ),
+        )
+        session_mgr.set_pending_approval(
+            "session-1",
+            RealCodexPendingApproval(
+                request_id=8,
+                method="item/commandExecution/requestApproval",
+                thread_id="external-thread-1",
+                turn_id="turn-1",
+                item_id="item-1",
+                prompt_message_id="approval-msg-1",
+            ),
+        )
+        approval_ui.set_pending("session-1", SimpleNamespace(prompt_message_id="approval-msg-1", prompt_text="Approve?"))
+
+        agent._session_mgr = session_mgr
+        agent._approval_ui = approval_ui
+        agent.controller = SimpleNamespace(emit_agent_message=AsyncMock())
+
+        await agent._handle_approval_response(request)
+
+        agent.controller.emit_agent_message.assert_awaited_once_with(
+            request.context,
+            "notify",
+            "❌ This Codex approval prompt is stale and was rejected.",
+        )
+        approval = session_mgr.get_pending_approval("session-1")
+        self.assertIsNotNone(approval)
+        assert approval is not None
+        self.assertEqual(approval.status, "pending")
+        approval_ui.update_prompt_after_answer.assert_not_awaited()
+        approval_ui.send_answer_receipt.assert_not_awaited()
+        approval_ui.signal_answer_received.assert_not_called()
 
 
 class CodexAgentPayloadTests(unittest.IsolatedAsyncioTestCase):

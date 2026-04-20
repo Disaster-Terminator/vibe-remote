@@ -89,11 +89,21 @@ class CodexEventHandler:
             if not turn_state:
                 logger.debug("Ignoring interrupted completion for unknown turn %s", turn_id)
                 return
+            await self._agent._expire_pending_approval_for_turn(
+                turn_id,
+                tracked_request,
+                reason="Codex approval expired because the resumed turn was interrupted.",
+            )
             self._agent._turn_registry.pop_turn(turn_id)
             await self._agent._remove_ack_reaction(tracked_request)
             return
 
         if status == "failed":
+            await self._agent._expire_pending_approval_for_turn(
+                turn_id,
+                tracked_request,
+                reason="Codex approval expired because the resumed turn failed.",
+            )
             if not turn_state:
                 logger.info("Ignoring failed completion for unknown turn %s", turn_id)
                 return
@@ -133,6 +143,11 @@ class CodexEventHandler:
             return
 
         pending = turn_state.pending_assistant if turn_state else None
+        await self._agent._expire_pending_approval_for_turn(
+            turn_id,
+            tracked_request,
+            reason="Codex approval expired because the resumed turn already completed.",
+        )
         self._agent._turn_registry.pop_turn(turn_id)
         if pending:
             pending_text, pending_parse_mode = pending
@@ -254,10 +269,20 @@ class CodexEventHandler:
         if turn_id:
             turn_state = self._agent._turn_registry.get_turn(turn_id)
             if not turn_state:
+                await self._agent._expire_pending_approval_for_turn(
+                    turn_id,
+                    request,
+                    reason="Codex approval expired because the resumed turn reported an error.",
+                )
                 logger.info("Ignoring Codex error for unknown turn %s: %s", turn_id, message)
                 return
 
             turn_state.terminal_error = message
+            await self._agent._expire_pending_approval_for_turn(
+                turn_id,
+                request,
+                reason="Codex approval expired because the resumed turn reported an error.",
+            )
             if (
                 self._agent._turn_registry.should_emit_terminal_error(turn_id)
                 and not turn_state.terminal_error_notified

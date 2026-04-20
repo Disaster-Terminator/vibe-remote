@@ -34,8 +34,14 @@ from modules.agents.opencode.utils import (
     resolve_opencode_allowed_providers,
     resolve_opencode_provider_preferences,
 )
-from modules.agents.native_sessions.display import format_display_summary, format_display_time
 from modules.agents.native_sessions.types import NativeResumeSession
+from .resume_picker import (
+    CodexAttachPresentation,
+    ResumePickerEntry,
+    build_codex_attach_summary_lines,
+    build_resume_picker_entries,
+    parse_resume_selection_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1871,6 +1877,8 @@ class SlackBot(BaseIMClient):
                     # Handle manual_input in resume_session_modal - show agent_block when user types
                     if action_id == "manual_input" and view.get("callback_id") == "resume_session_modal":
                         await self._handle_resume_modal_manual_input(view, action)
+                    if action_id == "session_select" and view.get("callback_id") == "resume_session_modal":
+                        await self._handle_resume_modal_session_select(view, action)
 
         elif payload.get("type") == "view_submission":
             # Handle modal submissions asynchronously to avoid Slack timeouts
@@ -1980,10 +1988,12 @@ class SlackBot(BaseIMClient):
                 thread_id = md.get("thread_id")
                 host_message_ts = md.get("host_message_ts")
                 default_agent = md.get("default_agent")
+                working_path = md.get("working_path")
             except Exception:
-                pass
+                working_path = None
 
             # Manual input takes precedence and should respect the manual agent selector.
+            extra_kwargs: dict[str, Any] = {}
             if manual_session:
                 chosen_session = manual_session
                 # When manually entering session ID, use selected agent or default
@@ -1992,11 +2002,58 @@ class SlackBot(BaseIMClient):
                 chosen_session = selected_session
                 chosen_agent = selected_agent or agent
 
+                entry = self._resolve_resume_picker_entry(working_path, selected_value)
+                attach = entry.codex_attach if entry is not None else None
+                if attach is not None:
+                    if not attach.is_actionable:
+                        context = MessageContext(
+                            user_id=user_id,
+                            channel_id=channel_id or user_id,
+                            platform="slack",
+                            thread_id=thread_id or None,
+                            message_id=host_message_ts or None,
+                            platform_specific={"is_dm": isinstance(channel_id, str) and channel_id.startswith("D")},
+                        )
+                        await self.send_message(context, f"ℹ️ {self._t('modal.resume.codexUnsupportedHint')}")
+                        return
+
+                    action_data = values.get("action_block", {}).get("action_select", {})
+                    selected_action = action_data.get("selected_option", {}).get("value") if isinstance(action_data, dict) else None
+                    if not selected_action and attach.actionable_actions:
+                        selected_action = attach.actionable_actions[0]
+                    submission_payload = attach.submission_payloads.get(str(selected_action or ""))
+                    if not isinstance(submission_payload, dict):
+                        context = MessageContext(
+                            user_id=user_id,
+                            channel_id=channel_id or user_id,
+                            platform="slack",
+                            thread_id=thread_id or None,
+                            message_id=host_message_ts or None,
+                            platform_specific={"is_dm": isinstance(channel_id, str) and channel_id.startswith("D")},
+                        )
+                        await self.send_message(context, f"ℹ️ {self._t('modal.resume.codexUnsupportedHint')}")
+                        return
+                    chosen_agent = submission_payload.get("agent") or chosen_agent
+                    chosen_session = submission_payload.get("session_id") or chosen_session
+                    extra_kwargs = {
+                        "action_intent": submission_payload.get("action_intent"),
+                        "codex_thread_id": submission_payload.get("codex_thread_id"),
+                    }
+
             if hasattr(self, "_on_resume_session"):
                 is_dm = isinstance(channel_id, str) and channel_id.startswith("D")
                 callback = self._on_resume_session
                 try:
-                    await callback(user_id, channel_id, thread_id, chosen_agent, chosen_session, host_message_ts, is_dm)
+                    await callback(
+                        user_id,
+                        channel_id,
+                        thread_id,
+                        chosen_agent,
+                        chosen_session,
+                        host_message_ts,
+                        is_dm,
+                        **extra_kwargs,
+                    )
                 except TypeError:
                     # Backward compatibility: older callback signature omitted is_dm.
                     await callback(user_id, channel_id, thread_id, chosen_agent, chosen_session, host_message_ts)
@@ -2631,6 +2688,7 @@ class SlackBot(BaseIMClient):
         channel_id: Optional[str],
         thread_id: Optional[str],
         host_message_ts: Optional[str],
+        working_path: Optional[str] = None,
     ):
         """Open a modal to let users select or input a session to resume."""
         self._ensure_clients()
@@ -2651,26 +2709,59 @@ class SlackBot(BaseIMClient):
                 }
             )
 
+        entries = build_resume_picker_entries(sessions)
         session_options = []
         total_session_options = 0
         max_session_options = 100
-        for item in sessions:
+        for entry in entries:
             if total_session_options >= max_session_options:
                 break
+            item = entry.item
             if item.agent not in allowed_agents:
                 continue
-            label = format_display_summary(item)
-            desc = format_display_time(item)
             session_options.append(
                 {
-                    "text": {"type": "plain_text", "text": label[:75], "emoji": True},
-                    "value": f"{item.agent}|{item.native_session_id}",
-                    "description": {"type": "plain_text", "text": desc[:75], "emoji": True},
+                    "text": {"type": "plain_text", "text": entry.label[:75], "emoji": True},
+                    "value": entry.selection_value,
+                    "description": {"type": "plain_text", "text": entry.description[:75], "emoji": True},
                 }
             )
             total_session_options += 1
 
-        blocks: list = [
+        metadata = {
+            "channel_id": channel_id,
+            "thread_id": thread_id,
+            "host_message_ts": host_message_ts,
+            "default_agent": agent_options[0]["value"] if agent_options else "opencode",
+            "agent_options": agent_options,  # Store for dynamic update
+            "working_path": working_path,
+        }
+        view = self._build_resume_modal_view(
+            metadata=metadata,
+            session_options=session_options,
+            agent_options=agent_options,
+            show_agent=False,
+        )
+
+        try:
+            await self.web_client.views_open(trigger_id=trigger_id, view=view)
+        except SlackApiError as e:
+            logger.error(f"Error opening resume modal: {e}")
+            raise
+
+    def _build_resume_modal_view(
+        self,
+        *,
+        metadata: Dict[str, Any],
+        session_options: List[Dict[str, Any]],
+        agent_options: List[Dict[str, Any]],
+        show_agent: bool,
+        selected_session_value: Optional[str] = None,
+        manual_session: str = "",
+        selected_attach: Optional[CodexAttachPresentation] = None,
+        selected_action: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        blocks: list[dict[str, Any]] = [
             {
                 "type": "section",
                 "text": {
@@ -2681,25 +2772,34 @@ class SlackBot(BaseIMClient):
         ]
 
         if session_options:
+            session_element: dict[str, Any] = {
+                "type": "static_select",
+                "action_id": "session_select",
+                "options": session_options,
+                "placeholder": {
+                    "type": "plain_text",
+                    "text": self._t("modal.resume.selectSession"),
+                    "emoji": True,
+                },
+            }
+            if selected_session_value:
+                initial_option = next(
+                    (option for option in session_options if option.get("value") == selected_session_value),
+                    None,
+                )
+                if initial_option is not None:
+                    session_element["initial_option"] = initial_option
             blocks.append(
                 {
                     "type": "input",
                     "block_id": "session_block",
                     "optional": True,
+                    "dispatch_action": True,
                     "label": {"type": "plain_text", "text": self._t("modal.resume.pickExisting"), "emoji": True},
-                    "element": {
-                        "type": "static_select",
-                        "action_id": "session_select",
-                        "options": session_options,
-                        "placeholder": {
-                            "type": "plain_text",
-                            "text": self._t("modal.resume.selectSession"),
-                            "emoji": True,
-                        },
-                    },
+                    "element": session_element,
                 }
             )
-            if total_session_options >= max_session_options:
+            if len(session_options) >= 100:
                 blocks.append(
                     {
                         "type": "context",
@@ -2724,94 +2824,97 @@ class SlackBot(BaseIMClient):
                 }
             )
 
+        if selected_attach is not None:
+            blocks.append({"type": "divider"})
+            summary_text = "\n".join(build_codex_attach_summary_lines(selected_attach))
+            blocks.append(
+                {
+                    "type": "section",
+                    "block_id": "attach_preview_block",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{self._t('modal.resume.codexInspectTitle')}*\n{summary_text}",
+                    },
+                }
+            )
+            if selected_attach.is_actionable:
+                action_options = []
+                for action in selected_attach.actionable_actions:
+                    label = self._t("common.resume") if action == "resume" else self._t("common.fork")
+                    action_options.append(
+                        {
+                            "text": {"type": "plain_text", "text": label, "emoji": True},
+                            "value": action,
+                        }
+                    )
+                initial_action = next(
+                    (option for option in action_options if option.get("value") == selected_action),
+                    action_options[0] if action_options else None,
+                )
+                action_element: dict[str, Any] = {
+                    "type": "static_select",
+                    "action_id": "action_select",
+                    "options": action_options,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": self._t("modal.resume.codexActionPlaceholder"),
+                        "emoji": True,
+                    },
+                }
+                if initial_action is not None:
+                    action_element["initial_option"] = initial_action
+                blocks.append(
+                    {
+                        "type": "input",
+                        "block_id": "action_block",
+                        "label": {
+                            "type": "plain_text",
+                            "text": self._t("modal.resume.codexActionLabel"),
+                            "emoji": True,
+                        },
+                        "element": action_element,
+                    }
+                )
+            else:
+                blocks.append(
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": self._t("modal.resume.codexUnsupportedHint"),
+                            }
+                        ],
+                    }
+                )
+
+        manual_element: dict[str, Any] = {
+            "type": "plain_text_input",
+            "action_id": "manual_input",
+            "placeholder": {
+                "type": "plain_text",
+                "text": self._t("modal.resume.pasteIdPlaceholder"),
+                "emoji": True,
+            },
+            "dispatch_action_config": {
+                "trigger_actions_on": ["on_character_entered"],
+            },
+        }
+        if manual_session:
+            manual_element["initial_value"] = manual_session
         blocks.append(
             {
                 "type": "input",
                 "block_id": "manual_block",
                 "optional": True,
                 "label": {"type": "plain_text", "text": self._t("modal.resume.pasteId"), "emoji": True},
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "manual_input",
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": self._t("modal.resume.pasteIdPlaceholder"),
-                        "emoji": True,
-                    },
-                    "dispatch_action_config": {
-                        "trigger_actions_on": ["on_character_entered"],
-                    },
-                },
+                "element": manual_element,
                 "dispatch_action": True,
             }
         )
 
-        # Agent backend selector is NOT included initially.
-        # It will be dynamically added when user types in the manual session ID field.
-
-        metadata = {
-            "channel_id": channel_id,
-            "thread_id": thread_id,
-            "host_message_ts": host_message_ts,
-            "default_agent": agent_options[0]["value"] if agent_options else "opencode",
-            "agent_options": agent_options,  # Store for dynamic update
-        }
-
-        view = {
-            "type": "modal",
-            "callback_id": "resume_session_modal",
-            "private_metadata": json.dumps(metadata),
-            "title": {"type": "plain_text", "text": self._t("modal.resume.title"), "emoji": True},
-            "submit": {"type": "plain_text", "text": self._t("common.resume"), "emoji": True},
-            "close": {"type": "plain_text", "text": self._t("common.cancel"), "emoji": True},
-            "blocks": blocks,
-        }
-
-        try:
-            await self.web_client.views_open(trigger_id=trigger_id, view=view)
-        except SlackApiError as e:
-            logger.error(f"Error opening resume modal: {e}")
-            raise
-
-    async def _handle_resume_modal_manual_input(self, view: Dict[str, Any], action: Dict[str, Any]):
-        """Handle manual_input changes in resume_session_modal - dynamically show/hide agent_block."""
-        self._ensure_clients()
-
-        view_id = view.get("id")
-        blocks = view.get("blocks", [])
-        metadata_raw = view.get("private_metadata", "{}")
-
-        try:
-            metadata = json.loads(metadata_raw)
-        except Exception:
-            metadata = {}
-
-        agent_options = metadata.get("agent_options", [])
-        if not agent_options:
-            return
-
-        # Check if agent_block already exists
-        has_agent_block = any(b.get("block_id") == "agent_block" for b in blocks)
-
-        # Get current input value
-        input_value = (action.get("value") or "").strip()
-
-        # Determine if we need to update
-        should_show_agent = bool(input_value)
-
-        if should_show_agent and has_agent_block:
-            # Already showing, no update needed
-            return
-        if not should_show_agent and not has_agent_block:
-            # Already hidden, no update needed
-            return
-
-        # Build updated blocks
-        new_blocks = [b for b in blocks if b.get("block_id") != "agent_block"]
-
-        if should_show_agent:
-            # Add agent_block at the end
-            new_blocks.append(
+        if show_agent:
+            blocks.append(
                 {
                     "type": "input",
                     "block_id": "agent_block",
@@ -2829,20 +2932,139 @@ class SlackBot(BaseIMClient):
                 }
             )
 
-        updated_view = {
+        return {
             "type": "modal",
             "callback_id": "resume_session_modal",
-            "private_metadata": metadata_raw,
+            "private_metadata": json.dumps(metadata),
             "title": {"type": "plain_text", "text": self._t("modal.resume.title"), "emoji": True},
             "submit": {"type": "plain_text", "text": self._t("common.resume"), "emoji": True},
             "close": {"type": "plain_text", "text": self._t("common.cancel"), "emoji": True},
-            "blocks": new_blocks,
+            "blocks": blocks,
         }
 
+    def _resolve_resume_picker_entry(
+        self,
+        working_path: Optional[str],
+        selected_value: Optional[str],
+    ) -> Optional[ResumePickerEntry]:
+        agent, session_id = parse_resume_selection_value(selected_value or "")
+        if not agent or not session_id or not working_path:
+            return None
+        native_session_service = getattr(getattr(self, "_controller", None), "native_session_service", None)
+        get_session = getattr(native_session_service, "get_session", None)
+        if not callable(get_session):
+            return None
+        item = get_session(working_path, agent, session_id)
+        if item is None:
+            return None
+        entries = build_resume_picker_entries([item])
+        return entries[0] if entries else None
+
+    async def _update_resume_modal_view(
+        self,
+        *,
+        view: Dict[str, Any],
+        selected_session_value: Optional[str],
+        manual_session: str,
+        show_agent: bool,
+        selected_attach: Optional[CodexAttachPresentation],
+        selected_action: Optional[str],
+    ) -> None:
+        view_id = view.get("id")
+        if not view_id:
+            return
+
+        metadata_raw = view.get("private_metadata", "{}")
+        try:
+            metadata = json.loads(metadata_raw)
+        except Exception:
+            metadata = {}
+
+        agent_options = metadata.get("agent_options", [])
+        blocks = view.get("blocks", [])
+        session_options = []
+        for block in blocks:
+            if block.get("block_id") != "session_block":
+                continue
+            element = block.get("element", {})
+            if isinstance(element, dict):
+                session_options = list(element.get("options") or [])
+            break
+
+        updated_view = self._build_resume_modal_view(
+            metadata=metadata,
+            session_options=session_options,
+            agent_options=agent_options,
+            show_agent=show_agent,
+            selected_session_value=selected_session_value,
+            manual_session=manual_session,
+            selected_attach=selected_attach,
+            selected_action=selected_action,
+        )
         try:
             await self.web_client.views_update(view_id=view_id, view=updated_view)
         except SlackApiError as e:
             logger.debug(f"Failed to update resume modal: {e}")
+
+    async def _handle_resume_modal_session_select(self, view: Dict[str, Any], action: Dict[str, Any]):
+        values = view.get("state", {}).get("values", {})
+        manual_data = values.get("manual_block", {}).get("manual_input", {})
+        manual_session = (manual_data.get("value") or "").strip()
+        selected_option = action.get("selected_option") or {}
+        selected_session_value = selected_option.get("value") if isinstance(selected_option, dict) else None
+        selected_action = None
+        working_path = None
+
+        metadata_raw = view.get("private_metadata", "{}")
+        try:
+            metadata = json.loads(metadata_raw)
+            working_path = metadata.get("working_path")
+        except Exception:
+            metadata = {}
+
+        attach_entry = None
+        if not manual_session:
+            attach_entry = self._resolve_resume_picker_entry(working_path, selected_session_value)
+        action_data = values.get("action_block", {}).get("action_select", {})
+        selected_action = action_data.get("selected_option", {}).get("value") if isinstance(action_data, dict) else None
+        await self._update_resume_modal_view(
+            view=view,
+            selected_session_value=selected_session_value,
+            manual_session=manual_session,
+            show_agent=bool(manual_session),
+            selected_attach=attach_entry.codex_attach if attach_entry and not manual_session else None,
+            selected_action=selected_action,
+        )
+
+    async def _handle_resume_modal_manual_input(self, view: Dict[str, Any], action: Dict[str, Any]):
+        """Handle manual_input changes in resume_session_modal - dynamically show/hide agent_block."""
+        self._ensure_clients()
+        input_value = (action.get("value") or "").strip()
+        values = view.get("state", {}).get("values", {})
+        session_data = values.get("session_block", {}).get("session_select", {})
+        selected_session_value = session_data.get("selected_option", {}).get("value") if isinstance(session_data, dict) else None
+        selected_action_data = values.get("action_block", {}).get("action_select", {})
+        selected_action = (
+            selected_action_data.get("selected_option", {}).get("value") if isinstance(selected_action_data, dict) else None
+        )
+
+        metadata_raw = view.get("private_metadata", "{}")
+        try:
+            metadata = json.loads(metadata_raw)
+        except Exception:
+            metadata = {}
+        attach_entry = None
+        if not input_value:
+            attach_entry = self._resolve_resume_picker_entry(metadata.get("working_path"), selected_session_value)
+
+        await self._update_resume_modal_view(
+            view=view,
+            selected_session_value=selected_session_value,
+            manual_session=input_value,
+            show_agent=bool(input_value),
+            selected_attach=attach_entry.codex_attach if attach_entry is not None else None,
+            selected_action=selected_action,
+        )
 
     def _get_default_opencode_agent_name(self, opencode_agents: list) -> Optional[str]:
         """Resolve the default OpenCode agent name."""

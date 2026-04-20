@@ -30,8 +30,13 @@ from modules.agents.opencode.utils import (
     resolve_opencode_default_model,
     resolve_opencode_provider_preferences,
 )
-from modules.agents.native_sessions.display import format_display_summary, format_display_time
 from modules.agents.native_sessions.types import NativeResumeSession
+from .resume_picker import (
+    ResumePickerEntry,
+    build_codex_attach_summary_lines,
+    build_resume_picker_entries,
+    index_resume_picker_entries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1223,7 +1228,9 @@ class DiscordBot(BaseIMClient):
         channel_id: str,
         thread_id: str,
         host_message_ts: Optional[str] = None,
+        working_path: Optional[str] = None,
     ):
+        del working_path
         interaction = trigger_id if isinstance(trigger_id, discord.Interaction) else None
         t = lambda key, **kw: self._t(key, channel_id, **kw)
         common_agents = ["claude", "codex", "opencode"]
@@ -1232,15 +1239,16 @@ class DiscordBot(BaseIMClient):
             registered_backends = list(self._controller.agent_service.agents.keys())
         allowed_agents = set(registered_backends or common_agents)
         sessions = [item for item in sessions if item.agent in allowed_agents]
+        entries = build_resume_picker_entries(sessions)
+        entries_by_value = index_resume_picker_entries(entries)
 
         options = []
-        for item in sessions:
-            label = format_display_summary(item)
+        for entry in entries:
             options.append(
                 discord.SelectOption(
-                    label=label[:100],
-                    value=f"{item.agent}|{item.native_session_id}",
-                    description=format_display_time(item)[:100],
+                    label=entry.label[:100],
+                    value=entry.selection_value,
+                    description=entry.description[:100],
                 )
             )
         if len(options) > 25:
@@ -1281,6 +1289,76 @@ class DiscordBot(BaseIMClient):
                 self.outer = outer
                 self.owner_id = owner_id
                 self.manual_session: Optional[str] = None
+                self.selected_value: Optional[str] = None
+                self.inspect_entry: Optional[ResumePickerEntry] = None
+                self._render()
+
+            def _content(self) -> str:
+                if self.inspect_entry is not None and self.inspect_entry.codex_attach is not None:
+                    summary = "\n".join(build_codex_attach_summary_lines(self.inspect_entry.codex_attach))
+                    if self.inspect_entry.codex_attach.is_actionable:
+                        footer = t("modal.resume.codexInspectPrompt")
+                    else:
+                        footer = t("modal.resume.codexUnsupportedHint")
+                    return f"🔎 {t('modal.resume.codexInspectTitle')}\n{summary}\n\n{footer}"
+
+                return "\n".join(
+                    [
+                        f"⏮️ {t('modal.resume.title')}",
+                        t("modal.resume.chooseOneOf"),
+                        (
+                            t("modal.resume.discordPickOrPaste")
+                            if has_recent_sessions
+                            else t("modal.resume.noSessionsFound")
+                        ),
+                    ]
+                )
+
+            def _render(self) -> None:
+                self.clear_items()
+                if self.inspect_entry is not None and self.inspect_entry.codex_attach is not None:
+                    attach = self.inspect_entry.codex_attach
+                    for action in attach.actionable_actions:
+                        label = t("common.resume") if action == "resume" else t("common.fork")
+                        style = discord.ButtonStyle.primary if action == "resume" else discord.ButtonStyle.secondary
+                        button = discord.ui.Button(label=label, style=style)
+
+                        async def attach_callback(
+                            attach_interaction: discord.Interaction,
+                            *,
+                            current_action: str = action,
+                        ):
+                            if hasattr(self.outer, "_on_resume_session"):
+                                await self.outer._on_resume_session(
+                                    str(attach_interaction.user.id),
+                                    channel_id,
+                                    thread_id,
+                                    self.inspect_entry.item.agent,
+                                    self.inspect_entry.item.native_session_id,
+                                    host_message_ts,
+                                    attach_interaction.guild is None,
+                                    action_intent=current_action,
+                                    codex_thread_id=attach.submission_payloads[current_action].get("codex_thread_id"),
+                                )
+                            try:
+                                await self.outer._dismiss_interaction_message(attach_interaction, " ")
+                            except Exception as err:
+                                logger.debug("Failed to dismiss Discord attach message: %s", err)
+
+                        button.callback = attach_callback
+                        self.add_item(button)
+
+                    back_button = discord.ui.Button(label=t("common.back"), style=discord.ButtonStyle.secondary)
+
+                    async def back_callback(back_interaction: discord.Interaction):
+                        self.inspect_entry = None
+                        self._render()
+                        await back_interaction.response.edit_message(content=self._content(), view=self)
+
+                    back_button.callback = back_callback
+                    self.add_item(back_button)
+                    return
+
                 self.session_select = discord.ui.Select(
                     placeholder=t("modal.resume.selectSession"),
                     options=options,
@@ -1299,11 +1377,22 @@ class DiscordBot(BaseIMClient):
                 )
                 self.resume_button = discord.ui.Button(label=t("common.resume"), style=discord.ButtonStyle.primary)
 
-                async def _defer(interaction: discord.Interaction):
-                    await interaction.response.defer()
+                async def session_callback(select_interaction: discord.Interaction):
+                    self.selected_value = self.session_select.values[0] if self.session_select.values else None
+                    selected_entry = entries_by_value.get(str(self.selected_value or ""))
+                    if selected_entry is not None and selected_entry.codex_attach is not None:
+                        self.inspect_entry = selected_entry
+                        self._render()
+                        await select_interaction.response.edit_message(content=self._content(), view=self)
+                        return
+                    self.inspect_entry = None
+                    await select_interaction.response.defer()
 
-                self.session_select.callback = _defer
-                self.agent_select.callback = _defer
+                async def agent_callback(select_interaction: discord.Interaction):
+                    await select_interaction.response.defer()
+
+                self.session_select.callback = session_callback
+                self.agent_select.callback = agent_callback
                 self.add_item(self.session_select)
                 self.add_item(self.agent_select)
                 self.add_item(self.manual_button)
@@ -1331,6 +1420,15 @@ class DiscordBot(BaseIMClient):
                 chosen_agent, chosen_session = selected.split("|", 1)
             if view.manual_session:
                 chosen_session = view.manual_session
+            selected_entry = entries_by_value.get(str(selected or ""))
+            if selected_entry is not None and selected_entry.codex_attach is not None:
+                view.inspect_entry = selected_entry
+                view._render()
+                try:
+                    await resume_interaction.edit_original_response(content=view._content(), view=view)
+                except Exception as err:
+                    logger.debug("Failed to enter Discord attach inspect mode: %s", err)
+                return
             if hasattr(self, "_on_resume_session"):
                 await self._on_resume_session(
                     str(resume_interaction.user.id),
@@ -1348,18 +1446,7 @@ class DiscordBot(BaseIMClient):
 
         view.manual_button.callback = manual_callback
         view.resume_button.callback = resume_callback
-
-        intro_text = "\n".join(
-            [
-                f"⏮️ {t('modal.resume.title')}",
-                t("modal.resume.chooseOneOf"),
-                (
-                    t("modal.resume.discordPickOrPaste")
-                    if has_recent_sessions
-                    else t("modal.resume.noSessionsFound")
-                ),
-            ]
-        )
+        intro_text = view._content()
 
         if interaction:
             await interaction.response.send_message(intro_text, view=view, ephemeral=True)

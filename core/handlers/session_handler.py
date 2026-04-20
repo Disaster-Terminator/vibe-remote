@@ -4,7 +4,8 @@ import asyncio
 import logging
 import os
 import time
-from typing import Optional, Dict, Any, Tuple
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Tuple, cast
 from uuid import uuid4
 from modules.im import MessageContext
 from modules.claude_sdk_compat import ClaudeSDKClient, ClaudeAgentOptions
@@ -299,11 +300,256 @@ class SessionHandler(BaseHandler):
         agent_label: str,
         session_id: str,
         preview: str = "",
+        provenance: str = "",
     ) -> str:
         lines = [f"✅ {self._t('success.sessionResumed', agent=agent_label, sessionId=session_id)}"]
+        if provenance:
+            lines.extend(["", provenance])
         if preview:
             lines.extend(["", preview])
         return "\n".join(lines)
+
+    def _get_native_session_service(self):
+        service_getter = getattr(self.controller, "get_native_session_service", None)
+        if callable(service_getter):
+            return service_getter()
+        return getattr(self.controller, "native_session_service", None)
+
+    def _get_native_session_item(
+        self,
+        context: MessageContext,
+        *,
+        agent: str,
+        session_id: str,
+    ):
+        native_session_service = cast(Any, self._get_native_session_service())
+        if native_session_service is None:
+            return None
+        try:
+            working_path = self.get_working_path(context)
+            return native_session_service.get_session(working_path, agent, session_id)
+        except Exception as exc:
+            logger.warning("Failed to resolve native session item for %s session %s: %s", agent, session_id, exc)
+            return None
+
+    @staticmethod
+    def _normalize_codex_attach_action(value: Any) -> Optional[str]:
+        action = str(value or "").strip().lower()
+        if action in {"resume", "fork"}:
+            return action
+        return None
+
+    def _normalize_codex_attach_actions(self, raw_actions: Any) -> list[str]:
+        if isinstance(raw_actions, str):
+            candidates = [raw_actions]
+        elif isinstance(raw_actions, (list, tuple, set)):
+            candidates = list(raw_actions)
+        else:
+            return []
+
+        actions: list[str] = []
+        for value in candidates:
+            action = self._normalize_codex_attach_action(value)
+            if action and action not in actions:
+                actions.append(action)
+        return actions
+
+    def _get_codex_attach_service(self):
+        agent_service = getattr(self.controller, "agent_service", None)
+        backend = getattr(agent_service, "agents", {}).get("codex") if agent_service else None
+        if backend is None:
+            return None
+        attach_service = getattr(backend, "attach_service", None)
+        if attach_service is None:
+            attach_service = getattr(backend, "_attach_service", None)
+        return attach_service
+
+    def _is_codex_attach_candidate(self, locator: dict[str, Any], *, explicit_action_intent: Optional[str]) -> bool:
+        attach_payload = locator.get("codex_attach")
+        if isinstance(attach_payload, dict):
+            return True
+        if explicit_action_intent:
+            return True
+        attach_keys = {
+            "allowed_actions",
+            "attach_source",
+            "attach_service_available",
+            "workspace_realpath",
+            "workspace_repo_root",
+            "workspace_fingerprint",
+            "validation_status",
+            "thread_id",
+            "codex_thread_id",
+        }
+        return any(key in locator for key in attach_keys)
+
+    def _resolve_codex_attach_request(
+        self,
+        context: MessageContext,
+        *,
+        session_id: str,
+        action_intent: Optional[str],
+        codex_thread_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        item = self._get_native_session_item(context, agent="codex", session_id=session_id)
+        locator = dict(item.locator) if item and isinstance(item.locator, dict) else {}
+        attach_payload = locator.get("codex_attach")
+        attach_data = dict(attach_payload) if isinstance(attach_payload, dict) else dict(locator)
+        explicit_action = self._normalize_codex_attach_action(action_intent)
+
+        if not self._is_codex_attach_candidate(locator, explicit_action_intent=explicit_action):
+            return None
+
+        requested_thread_id = str(
+            codex_thread_id
+            or attach_data.get("codex_thread_id")
+            or attach_data.get("thread_id")
+            or session_id
+        ).strip()
+        allowed_actions = self._normalize_codex_attach_actions(attach_data.get("allowed_actions"))
+
+        return {
+            "item": item,
+            "attach_data": attach_data,
+            "requested_thread_id": requested_thread_id,
+            "explicit_action": explicit_action,
+            "allowed_actions": allowed_actions,
+        }
+
+    def _format_codex_attach_validation_error(self, validation: Any) -> str:
+        return self._t(
+            "error.codexAttachValidationFailed",
+            reason=getattr(validation, "message", "Workspace validation failed."),
+            status=getattr(validation, "status", "unknown"),
+        )
+
+    def _build_codex_attach_provenance(self, *, attach_mode: str, thread_id: str, source_thread_id: Optional[str]) -> str:
+        if attach_mode == "fork":
+            return self._t(
+                "success.codexAttachForkedFromExternalThread",
+                sourceThreadId=source_thread_id or "unknown",
+                threadId=thread_id,
+            )
+        return self._t("success.codexAttachResumedExternalThread", threadId=thread_id)
+
+    async def _execute_codex_attach_submission(
+        self,
+        context: MessageContext,
+        *,
+        session_key: str,
+        current_base_session_id: str,
+        session_id: str,
+        action_intent: Optional[str],
+        codex_thread_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        attach_request = self._resolve_codex_attach_request(
+            context,
+            session_id=session_id,
+            action_intent=action_intent,
+            codex_thread_id=codex_thread_id,
+        )
+        if attach_request is None:
+            return None
+
+        requested_thread_id = str(attach_request["requested_thread_id"] or "").strip()
+        if not requested_thread_id:
+            raise ValueError(self._t("error.codexAttachMissingThreadId"))
+
+        attach_service = self._get_codex_attach_service()
+        if attach_service is None:
+            raise ValueError(self._t("error.codexAttachServiceUnavailable"))
+
+        working_path = self.get_working_path(context)
+        attach_data = attach_request["attach_data"]
+        pre_validation = attach_service.validate_workspace(
+            working_path,
+            expected_realpath=str(attach_data.get("workspace_realpath") or "").strip() or None,
+            expected_repo_root=str(attach_data.get("workspace_repo_root") or "").strip() or None,
+            expected_fingerprint=str(attach_data.get("workspace_fingerprint") or "").strip() or None,
+        )
+        if not getattr(pre_validation, "is_valid", False):
+            raise ValueError(self._format_codex_attach_validation_error(pre_validation))
+
+        explicit_action = attach_request["explicit_action"]
+        allowed_actions = attach_request["allowed_actions"]
+        if explicit_action and allowed_actions and explicit_action not in allowed_actions:
+            raise ValueError(self._t("error.codexAttachUnsupportedAction", action=explicit_action))
+
+        lookup = getattr(self.sessions, "find_codex_external_attachments_by_thread_id", None)
+        existing_bindings = cast(list[Any], lookup(requested_thread_id) if callable(lookup) else [])
+        conflicting_bindings = [
+            binding
+            for binding in existing_bindings
+            if not (
+                getattr(binding, "session_key", None) == session_key
+                and getattr(binding, "base_session_id", None) == current_base_session_id
+            )
+        ]
+
+        attach_mode = explicit_action
+        if conflicting_bindings and attach_mode != "fork":
+            if allowed_actions and "fork" not in allowed_actions:
+                raise ValueError(self._t("error.codexAttachUnsupportedAction", action="fork"))
+            attach_mode = "fork"
+
+        if attach_mode is None:
+            if "resume" in allowed_actions:
+                attach_mode = "resume"
+            elif "fork" in allowed_actions:
+                attach_mode = "fork"
+            else:
+                attach_mode = "resume"
+
+        if allowed_actions and attach_mode not in allowed_actions:
+            raise ValueError(self._t("error.codexAttachUnsupportedAction", action=attach_mode))
+
+        if attach_mode == "fork":
+            attach_result = await attach_service.fork_thread(working_path, requested_thread_id)
+        else:
+            attach_result = await attach_service.resume_thread(working_path, requested_thread_id)
+
+        post_validation = getattr(attach_result, "workspace_validation", None)
+        if not getattr(post_validation, "is_valid", False):
+            raise ValueError(self._format_codex_attach_validation_error(post_validation))
+
+        resolved_thread_id = str(getattr(attach_result, "thread_id", "") or "").strip()
+        if not resolved_thread_id:
+            raise ValueError(self._t("error.codexAttachMissingThreadId"))
+
+        attach_metadata = getattr(attach_result, "attach_metadata", None)
+        workspace = (
+            getattr(attach_result, "workspace", None)
+            or getattr(attach_metadata, "candidate_workspace", None)
+            or getattr(post_validation, "candidate_workspace", None)
+        )
+        if workspace is None:
+            raise ValueError(self._format_codex_attach_validation_error(post_validation))
+
+        timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        forked_from_thread_id = getattr(attach_metadata, "forked_from_thread_id", None)
+        if attach_mode == "fork" and not forked_from_thread_id:
+            forked_from_thread_id = requested_thread_id
+
+        return {
+            "resolved_session_id": resolved_thread_id,
+            "confirmation_provenance": self._build_codex_attach_provenance(
+                attach_mode=attach_mode,
+                thread_id=resolved_thread_id,
+                source_thread_id=forked_from_thread_id or requested_thread_id,
+            ),
+            "attachment_record": {
+                "binding_origin": "external_attached",
+                "codex_thread_id": resolved_thread_id,
+                "attach_mode": attach_mode,
+                "workspace_realpath": getattr(workspace, "realpath", ""),
+                "workspace_repo_root": getattr(workspace, "repo_root", None),
+                "workspace_fingerprint": getattr(workspace, "workspace_fingerprint", ""),
+                "forked_from_thread_id": forked_from_thread_id,
+                "attached_at": timestamp,
+                "last_validated_at": timestamp,
+                "validation_status": getattr(post_validation, "status", "valid"),
+            },
+        }
 
     def _build_resume_followup(
         self,
@@ -333,11 +579,7 @@ class SessionHandler(BaseHandler):
         agent: str,
         session_id: str,
     ) -> str:
-        service_getter = getattr(self.controller, "get_native_session_service", None)
-        if callable(service_getter):
-            native_session_service = service_getter()
-        else:
-            native_session_service = getattr(self.controller, "native_session_service", None)
+        native_session_service = self._get_native_session_service()
         if native_session_service is None:
             return ""
         try:
@@ -612,6 +854,8 @@ class SessionHandler(BaseHandler):
         host_message_ts: Optional[str] = None,
         is_dm: bool = False,
         platform: Optional[str] = None,
+        action_intent: Optional[str] = None,
+        codex_thread_id: Optional[str] = None,
     ) -> None:
         """Bind a provided session_id to the current thread for the chosen agent."""
         from modules.settings_manager import ChannelRouting
@@ -643,8 +887,25 @@ class SessionHandler(BaseHandler):
 
             settings_key = self._get_settings_key(context)
             session_key = self._get_session_key(context)
-            settings_manager = self._get_settings_manager(context)
+            settings_manager = cast(Any, self._get_settings_manager(context))
             current_routing = settings_manager.get_channel_routing(settings_key)
+
+            current_base_session_id = self.get_base_session_id(context)
+            attach_binding = None
+            effective_session_id = session_id
+            confirmation_provenance = ""
+            if agent == "codex":
+                attach_binding = await self._execute_codex_attach_submission(
+                    context,
+                    session_key=session_key,
+                    current_base_session_id=current_base_session_id,
+                    session_id=session_id,
+                    action_intent=action_intent,
+                    codex_thread_id=codex_thread_id,
+                )
+                if attach_binding is not None:
+                    effective_session_id = attach_binding["resolved_session_id"]
+                    confirmation_provenance = attach_binding["confirmation_provenance"]
 
             routing = ChannelRouting(
                 agent_backend=agent,
@@ -663,8 +924,9 @@ class SessionHandler(BaseHandler):
             preview = self._get_resume_preview(context, agent=agent, session_id=session_id)
             confirmation = self._build_resume_confirmation(
                 agent_label=agent_label,
-                session_id=session_id,
+                session_id=effective_session_id,
                 preview=preview,
+                provenance=confirmation_provenance,
             )
 
             initial_context = context
@@ -679,7 +941,7 @@ class SessionHandler(BaseHandler):
                     files=context.files,
                 )
 
-            confirmation_ts = await self._get_im_client(initial_context).send_message(
+            confirmation_ts = await cast(Any, self._get_im_client(initial_context)).send_message(
                 initial_context, confirmation, parse_mode="markdown"
             )
 
@@ -698,7 +960,7 @@ class SessionHandler(BaseHandler):
 
             followup = self._build_resume_followup(followup_context, is_dm=is_dm)
             if followup:
-                await self._get_im_client(followup_context).send_message(
+                await cast(Any, self._get_im_client(followup_context)).send_message(
                     followup_context,
                     followup,
                     parse_mode="markdown",
@@ -739,7 +1001,13 @@ class SessionHandler(BaseHandler):
             if agent == "opencode":
                 mapping_key = f"{base_session_id}:{working_path}"
 
-            self.sessions.set_agent_session_mapping(session_key, agent, mapping_key, session_id)
+            self.sessions.set_agent_session_mapping(session_key, agent, mapping_key, effective_session_id)
+            if attach_binding is not None:
+                self.sessions.upsert_codex_external_attachment(
+                    session_key,
+                    base_session_id,
+                    **attach_binding["attachment_record"],
+                )
             self.sessions.mark_thread_active(user_id, context.channel_id, mapped_thread)
         except Exception as e:
             logger.error(f"Error resuming session: {e}", exc_info=True)

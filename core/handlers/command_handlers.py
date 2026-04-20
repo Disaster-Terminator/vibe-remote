@@ -1,5 +1,6 @@
 """Command handlers for bot commands like /start, /new, /cwd, etc."""
 
+from dataclasses import replace
 import logging
 import os
 import time
@@ -135,15 +136,107 @@ class CommandHandlers(BaseHandler):
             native_session_service = service_getter()
         else:
             native_session_service = getattr(self.controller, "native_session_service", None)
-        if native_session_service is None:
+        list_recent_sessions = getattr(native_session_service, "list_recent_sessions", None)
+        if native_session_service is None or not callable(list_recent_sessions):
             return working_path, []
-        sessions = native_session_service.list_recent_sessions(working_path, limit=limit)
+        sessions = list_recent_sessions(working_path, limit=limit)
         agent_service = getattr(self.controller, "agent_service", None)
         registered_agents = getattr(agent_service, "agents", None)
         if isinstance(registered_agents, dict) and registered_agents:
             allowed_agents = set(registered_agents.keys())
             sessions = [item for item in sessions if item.agent in allowed_agents]
         return working_path, sessions
+
+    @staticmethod
+    def _normalize_codex_attach_actions(raw_actions: Any) -> list[str]:
+        if isinstance(raw_actions, str):
+            candidates = [raw_actions]
+        elif isinstance(raw_actions, (list, tuple, set)):
+            candidates = list(raw_actions)
+        else:
+            return []
+
+        actions: list[str] = []
+        for value in candidates:
+            action = str(value or "").strip().lower()
+            if action in {"resume", "fork", "inspect_only"} and action not in actions:
+                actions.append(action)
+        return actions
+
+    def _build_codex_attach_picker_payload(self, item: NativeResumeSession) -> Optional[dict[str, Any]]:
+        if item.agent != "codex":
+            return None
+
+        locator = item.locator if isinstance(item.locator, dict) else {}
+        attach_payload = locator.get("codex_attach")
+        normalized = dict(attach_payload) if isinstance(attach_payload, dict) else {}
+
+        candidate_keys = {
+            "allowed_actions",
+            "validation_status",
+            "workspace_match",
+            "materialized_history_available",
+            "materialized_history",
+            "codex_thread_id",
+            "thread_id",
+            "title",
+            "preview",
+            "last_activity",
+        }
+        for key in candidate_keys:
+            if key not in normalized and key in locator:
+                normalized[key] = locator[key]
+
+        allowed_actions = self._normalize_codex_attach_actions(normalized.get("allowed_actions"))
+        if not normalized and not allowed_actions:
+            return None
+
+        codex_thread_id = str(
+            normalized.get("codex_thread_id")
+            or normalized.get("thread_id")
+            or item.native_session_id
+        )
+        normalized["codex_thread_id"] = codex_thread_id
+        normalized["inspect_first"] = True
+        normalized["allowed_actions"] = allowed_actions
+        normalized["inspect_payload"] = {
+            "agent": item.agent,
+            "session_id": item.native_session_id,
+            "codex_thread_id": codex_thread_id,
+        }
+
+        submission_payloads: dict[str, dict[str, str]] = {}
+        for action in ("resume", "fork"):
+            if action not in allowed_actions:
+                continue
+            submission_payloads[action] = {
+                "agent": item.agent,
+                "session_id": item.native_session_id,
+                "codex_thread_id": codex_thread_id,
+                "action_intent": action,
+            }
+        normalized["submission_payloads"] = submission_payloads
+        normalized["action_intents"] = list(submission_payloads.keys())
+        return normalized
+
+    def _build_resume_picker_sessions(
+        self,
+        context: MessageContext,
+        *,
+        limit: int = 100,
+    ) -> tuple[str, list[NativeResumeSession]]:
+        working_path, sessions = self._list_recent_native_sessions(context, limit=limit)
+        picker_sessions: list[NativeResumeSession] = []
+        for item in sessions:
+            codex_attach = self._build_codex_attach_picker_payload(item)
+            if codex_attach is None:
+                picker_sessions.append(item)
+                continue
+
+            locator = dict(item.locator) if isinstance(item.locator, dict) else {}
+            locator["codex_attach"] = codex_attach
+            picker_sessions.append(replace(item, locator=locator))
+        return working_path, picker_sessions
 
     @staticmethod
     def _format_resume_time(item: NativeResumeSession) -> str:
@@ -177,6 +270,13 @@ class CommandHandlers(BaseHandler):
             ]
         )
         await self._get_im_client(channel_context).send_message(channel_context, "\n".join(lines))
+
+    async def _send_wechat_codex_attach_notice(self, context: MessageContext) -> None:
+        channel_context = self._get_channel_context(context)
+        await self._get_im_client(channel_context).send_message(
+            channel_context,
+            f"ℹ️ {self._t('command.resume.attachActionUnsupported')}",
+        )
 
     async def _send_wechat_resume_page(self, context: MessageContext, *, page: int) -> None:
         page_size = self._wechat_resume_page_size
@@ -230,6 +330,9 @@ class CommandHandlers(BaseHandler):
         if lines and not lines[-1]:
             lines.pop()
 
+        if any(self._build_codex_attach_picker_payload(item) is not None for item in page_items):
+            lines.extend(["", f"ℹ️ {self._t('command.resume.attachActionUnsupported')}"])
+
         lines.extend(
             [
                 "",
@@ -261,6 +364,9 @@ class CommandHandlers(BaseHandler):
         if not isinstance(item, NativeResumeSession):
             await self._send_wechat_resume_usage(context, include_snapshot_expired=True)
             return
+        if self._build_codex_attach_picker_payload(item) is not None:
+            await self._send_wechat_codex_attach_notice(context)
+            return
 
         await self.controller.session_handler.handle_resume_session_submission(
             user_id=context.user_id,
@@ -288,6 +394,9 @@ class CommandHandlers(BaseHandler):
             return
 
         item = sessions[0]
+        if self._build_codex_attach_picker_payload(item) is not None:
+            await self._send_wechat_codex_attach_notice(context)
+            return
         await self.controller.session_handler.handle_resume_session_submission(
             user_id=context.user_id,
             channel_id=context.channel_id,
@@ -725,7 +834,7 @@ class CommandHandlers(BaseHandler):
             interaction = context.platform_specific.get("interaction") if context.platform_specific else None
             if interaction and hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    _, sessions = self._list_recent_native_sessions(context, limit=25)
+                    working_path, sessions = self._build_resume_picker_sessions(context, limit=25)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=interaction,
@@ -733,6 +842,7 @@ class CommandHandlers(BaseHandler):
                             channel_id=context.channel_id,
                             thread_id=context.thread_id or context.message_id or "",
                             host_message_ts=context.message_id,
+                            working_path=working_path,
                         )
                     )
                     return
@@ -744,7 +854,7 @@ class CommandHandlers(BaseHandler):
         if platform == "telegram":
             if hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    _, sessions = self._list_recent_native_sessions(context, limit=25)
+                    working_path, sessions = self._build_resume_picker_sessions(context, limit=25)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=context,
@@ -752,6 +862,7 @@ class CommandHandlers(BaseHandler):
                             channel_id=context.channel_id,
                             thread_id=context.thread_id or context.message_id or "",
                             host_message_ts=context.message_id,
+                            working_path=working_path,
                         )
                     )
                     return
@@ -766,7 +877,7 @@ class CommandHandlers(BaseHandler):
         if platform == "lark":
             if hasattr(im_client, "open_resume_session_modal"):
                 try:
-                    _, sessions = self._list_recent_native_sessions(context, limit=100)
+                    working_path, sessions = self._build_resume_picker_sessions(context, limit=100)
                     await im_client.run_on_client_loop(
                         im_client.open_resume_session_modal(
                             trigger_id=context,
@@ -774,6 +885,7 @@ class CommandHandlers(BaseHandler):
                             channel_id=context.channel_id,
                             thread_id=context.thread_id or context.message_id or "",
                             host_message_ts=context.message_id,
+                            working_path=working_path,
                         )
                     )
                     return
@@ -797,7 +909,7 @@ class CommandHandlers(BaseHandler):
             return
 
         try:
-            _, sessions = self._list_recent_native_sessions(context, limit=100)
+            working_path, sessions = self._build_resume_picker_sessions(context, limit=100)
             await im_client.run_on_client_loop(
                 im_client.open_resume_session_modal(
                     trigger_id=trigger_id,
@@ -805,6 +917,7 @@ class CommandHandlers(BaseHandler):
                     channel_id=context.channel_id,
                     thread_id=context.thread_id or context.message_id or "",
                     host_message_ts=context.message_id,
+                    working_path=working_path,
                 )
             )
         except Exception as e:

@@ -1,8 +1,8 @@
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from core.controller import Controller
 from core.handlers.command_handlers import CommandHandlers
 from core.handlers.session_handler import SessionHandler
 from modules.agents.native_sessions.types import NativeResumeSession
@@ -20,6 +20,8 @@ class _StubSettingsManager:
         self.set_calls = []
         self.mark_calls = []
         self.routing_calls = []
+        self.codex_attachment_upserts = []
+        self.codex_attachments = {}
 
     def set_agent_session_mapping(self, settings_key, agent_name, thread_id, session_id):
         self.set_calls.append((settings_key, agent_name, thread_id, session_id))
@@ -36,20 +38,45 @@ class _StubSettingsManager:
     def set_channel_routing(self, settings_key, routing):
         self.routing_calls.append((settings_key, routing))
 
+    def upsert_codex_external_attachment(self, session_key, base_session_id, **kwargs):
+        record = SimpleNamespace(**kwargs)
+        self.codex_attachments[(str(session_key), base_session_id)] = record
+        self.codex_attachment_upserts.append((str(session_key), base_session_id, record))
+
+    def get_codex_external_attachment(self, session_key, base_session_id):
+        return self.codex_attachments.get((str(session_key), base_session_id))
+
+    def find_codex_external_attachments_by_thread_id(self, codex_thread_id):
+        matches = []
+        for (session_key, base_session_id), attachment in self.codex_attachments.items():
+            if getattr(attachment, "codex_thread_id", None) != codex_thread_id:
+                continue
+            matches.append(
+                SimpleNamespace(
+                    session_key=session_key,
+                    base_session_id=base_session_id,
+                    attachment=attachment,
+                )
+            )
+        return matches
+
 
 class _StubIMClient:
     def __init__(self):
         self.messages = []
         self.resume_calls = []
-        self.prepared_context = None
+        self.prepared_context: MessageContext | None = None
+        self.should_use_thread_for_reply = lambda: True
+        self.should_use_message_id_for_channel_session = lambda context=None: True
+        self.should_use_thread_for_dm_session = lambda: False
 
     async def send_message(self, context, text, parse_mode=None):
         ts = f"T{len(self.messages) + 1}"
         self.messages.append((context.channel_id, context.thread_id, text, ts))
         return ts
 
-    async def open_resume_session_modal(self, trigger_id, sessions, channel_id, thread_id, host_message_ts):
-        self.resume_calls.append((trigger_id, sessions, channel_id, thread_id, host_message_ts))
+    async def open_resume_session_modal(self, trigger_id, sessions, channel_id, thread_id, host_message_ts, working_path=None):
+        self.resume_calls.append((trigger_id, sessions, channel_id, thread_id, host_message_ts, working_path))
 
     async def run_on_client_loop(self, coro):
         return await coro
@@ -81,7 +108,7 @@ class _StubConfig:
         self.claude = type("ClaudeCfg", (), {"cwd": "/tmp"})()
 
 
-class _StubController(Controller):
+class _StubController:
     def __init__(self):
         # Bypass base __init__ to avoid wiring everything
         pass
@@ -95,7 +122,7 @@ class _StubController(Controller):
         self.claude_sessions = {}
         self.receiver_tasks = {}
         self.stored_session_mappings = {}
-        self.agent_service = type("A", (), {"agents": {"claude": object(), "codex": object()}})()
+        self.agent_service = SimpleNamespace(agents={"claude": object(), "codex": object()})
         self.native_session_service = _StubNativeSessionService()
         self.command_handler = CommandHandlers(self)
         self.session_handler = SessionHandler(self)
@@ -108,6 +135,123 @@ class _StubController(Controller):
 
     def get_cwd(self, context: MessageContext) -> str:
         return "/Users/cyh/vibe-remote"
+
+
+def _codex_workspace(cwd: str = "/Users/cyh/vibe-remote"):
+    return SimpleNamespace(
+        cwd=cwd,
+        realpath=cwd,
+        repo_root=cwd,
+        workspace_fingerprint=f"repo:{cwd}",
+    )
+
+
+def _codex_validation(
+    *,
+    status: str = "valid",
+    is_valid: bool = True,
+    message: str = "Workspace validation succeeded.",
+    requested_workspace=None,
+    candidate_workspace=None,
+):
+    requested = requested_workspace or _codex_workspace()
+    candidate = candidate_workspace if candidate_workspace is not None else requested
+    return SimpleNamespace(
+        requested_workspace=requested,
+        candidate_workspace=candidate,
+        status=status,
+        is_valid=is_valid,
+        message=message,
+    )
+
+
+def _codex_attach_result(
+    *,
+    thread_id: str,
+    attach_mode: str,
+    source_thread_id: str | None = None,
+    workspace=None,
+):
+    resolved_workspace = workspace or _codex_workspace()
+    validation = _codex_validation(requested_workspace=resolved_workspace, candidate_workspace=resolved_workspace)
+    return SimpleNamespace(
+        thread_id=thread_id,
+        workspace=resolved_workspace,
+        workspace_validation=validation,
+        attach_metadata=SimpleNamespace(
+            candidate_workspace=resolved_workspace,
+            requested_workspace=resolved_workspace,
+            workspace_validation=validation,
+            attach_mode=attach_mode,
+            requested_thread_id=source_thread_id or thread_id,
+            resolved_thread_id=thread_id,
+            forked_from_thread_id=source_thread_id,
+        ),
+        raw_result={},
+    )
+
+
+def _codex_attach_session(
+    *,
+    thread_id: str,
+    allowed_actions: list[str],
+    validation_status: str = "valid",
+    workspace_match: bool = True,
+):
+    return NativeResumeSession(
+        agent="codex",
+        agent_prefix="cx",
+        native_session_id=thread_id,
+        working_path="/Users/cyh/vibe-remote",
+        created_at=None,
+        updated_at=None,
+        sort_ts=100.0,
+        last_agent_message="Inspect this external Codex thread before binding.",
+        last_agent_tail="...inspect before binding",
+        locator={
+            "title": "External Codex Thread",
+            "preview": "Inspect this external Codex thread before binding.",
+            "thread_id": thread_id,
+            "codex_thread_id": thread_id,
+            "attach_source": "app_server",
+            "attach_service_available": True,
+            "validation_status": validation_status,
+            "workspace_match": workspace_match,
+            "workspace_realpath": "/Users/cyh/vibe-remote",
+            "workspace_repo_root": "/Users/cyh/vibe-remote",
+            "workspace_fingerprint": "repo:/Users/cyh/vibe-remote",
+            "materialized_history": True,
+            "allowed_actions": allowed_actions,
+        },
+    )
+
+
+class _StubCodexAttachService:
+    def __init__(self, *, validation, resume_result=None, fork_result=None):
+        self.validation = validation
+        self.resume_thread = AsyncMock(return_value=resume_result)
+        self.fork_thread = AsyncMock(return_value=fork_result)
+        self.validation_calls = []
+
+    def validate_workspace(
+        self,
+        cwd: str,
+        *,
+        candidate_cwd=None,
+        expected_realpath=None,
+        expected_repo_root=None,
+        expected_fingerprint=None,
+    ):
+        self.validation_calls.append(
+            {
+                "cwd": cwd,
+                "candidate_cwd": candidate_cwd,
+                "expected_realpath": expected_realpath,
+                "expected_repo_root": expected_repo_root,
+                "expected_fingerprint": expected_fingerprint,
+            }
+        )
+        return self.validation
 
 
 class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -177,8 +321,8 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig())
         ctrl.im_client.should_use_thread_for_reply = lambda: True
-        codex_agent = type("CodexAgent", (), {"prepare_resume_binding": AsyncMock()})()
-        ctrl.agent_service = type("A", (), {"agents": {"claude": object(), "codex": codex_agent}})()
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock())
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U999",
@@ -200,8 +344,8 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig())
         ctrl.im_client.should_use_thread_for_reply = lambda: True
-        claude_agent = type("ClaudeAgent", (), {"prepare_resume_binding": AsyncMock()})()
-        ctrl.agent_service = type("A", (), {"agents": {"claude": claude_agent, "codex": object()}})()
+        claude_agent = SimpleNamespace(prepare_resume_binding=AsyncMock())
+        ctrl.agent_service = SimpleNamespace(agents={"claude": claude_agent, "codex": object()})
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U123",
@@ -217,12 +361,296 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
             working_path="/Users/cyh/vibe-remote",
         )
 
+    async def test_codex_external_attach_resumes_and_persists_provenance(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-1", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            resume_result=_codex_attach_result(thread_id="external-thread-1", attach_mode="resume"),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-1",
+            action_intent="resume",
+            codex_thread_id="external-thread-1",
+        )
+
+        attach_service.resume_thread.assert_awaited_once_with("/Users/cyh/vibe-remote", "external-thread-1")
+        attach_service.fork_thread.assert_not_awaited()
+        codex_agent.prepare_resume_binding.assert_awaited_once_with(
+            base_session_id="slack_169999.123",
+            session_key="slack::C111",
+            working_path="/Users/cyh/vibe-remote",
+        )
+        self.assertEqual(settings.routing_calls[0][0], "C111")
+        self.assertEqual(
+            settings.set_calls,
+            [("slack::C111", "codex", "slack_169999.123", "external-thread-1")],
+        )
+        self.assertEqual(settings.mark_calls, [("U123", "C111", "169999.123")])
+        attachment = settings.get_codex_external_attachment("slack::C111", "slack_169999.123")
+        self.assertIsNotNone(attachment)
+        assert attachment is not None
+        self.assertEqual(attachment.binding_origin, "external_attached")
+        self.assertEqual(attachment.codex_thread_id, "external-thread-1")
+        self.assertEqual(attachment.attach_mode, "resume")
+        self.assertEqual(attachment.workspace_fingerprint, "repo:/Users/cyh/vibe-remote")
+        self.assertEqual(attachment.validation_status, "valid")
+        self.assertEqual(len(im_client.messages), 2)
+        self.assertIn("external-thread-1", im_client.messages[0][2])
+        self.assertIn("external Codex thread", im_client.messages[0][2])
+
+    async def test_codex_external_attach_forks_and_persists_provenance(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-2", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            fork_result=_codex_attach_result(
+                thread_id="forked-thread-2",
+                attach_mode="fork",
+                source_thread_id="external-thread-2",
+            ),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-2",
+            action_intent="fork",
+            codex_thread_id="external-thread-2",
+        )
+
+        attach_service.resume_thread.assert_not_awaited()
+        attach_service.fork_thread.assert_awaited_once_with("/Users/cyh/vibe-remote", "external-thread-2")
+        self.assertEqual(
+            settings.set_calls,
+            [("slack::C111", "codex", "slack_169999.123", "forked-thread-2")],
+        )
+        attachment = settings.get_codex_external_attachment("slack::C111", "slack_169999.123")
+        self.assertIsNotNone(attachment)
+        assert attachment is not None
+        self.assertEqual(attachment.codex_thread_id, "forked-thread-2")
+        self.assertEqual(attachment.attach_mode, "fork")
+        self.assertEqual(attachment.forked_from_thread_id, "external-thread-2")
+        self.assertIn("forked-thread-2", im_client.messages[0][2])
+        self.assertIn("external-thread-2", im_client.messages[0][2])
+
+    async def test_codex_external_attach_validation_failure_mutates_nothing(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-3", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(
+                status="realpath_mismatch",
+                is_valid=False,
+                message="Normalized working directory does not match the target thread workspace.",
+            ),
+            resume_result=_codex_attach_result(thread_id="external-thread-3", attach_mode="resume"),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-3",
+            action_intent="resume",
+            codex_thread_id="external-thread-3",
+        )
+
+        attach_service.resume_thread.assert_not_awaited()
+        attach_service.fork_thread.assert_not_awaited()
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(settings.codex_attachment_upserts, [])
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("realpath_mismatch", im_client.messages[0][2])
+        self.assertIn("Normalized working directory does not match", im_client.messages[0][2])
+
+    async def test_codex_external_attach_missing_result_thread_id_mutates_nothing(self):
+        settings = _StubSettingsManager()
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-4", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            resume_result=_codex_attach_result(thread_id="", attach_mode="resume"),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-4",
+            action_intent="resume",
+            codex_thread_id="external-thread-4",
+        )
+
+        attach_service.resume_thread.assert_awaited_once_with("/Users/cyh/vibe-remote", "external-thread-4")
+        attach_service.fork_thread.assert_not_awaited()
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(settings.codex_attachment_upserts, [])
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("missing the target thread id", im_client.messages[0][2])
+
+    async def test_codex_external_attach_duplicate_without_fork_permission_fails_closed(self):
+        settings = _StubSettingsManager()
+        settings.upsert_codex_external_attachment(
+            "slack::OTHER",
+            "slack_existing",
+            binding_origin="external_attached",
+            codex_thread_id="external-thread-resume-only",
+            attach_mode="resume",
+            workspace_realpath="/Users/cyh/vibe-remote",
+            workspace_repo_root="/Users/cyh/vibe-remote",
+            workspace_fingerprint="repo:/Users/cyh/vibe-remote",
+            forked_from_thread_id=None,
+            attached_at="2026-04-19T12:00:00Z",
+            last_validated_at="2026-04-19T12:00:00Z",
+            validation_status="valid",
+        )
+        seeded_attachment_writes = len(settings.codex_attachment_upserts)
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-resume-only", allowed_actions=["resume"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            resume_result=_codex_attach_result(thread_id="external-thread-resume-only", attach_mode="resume"),
+            fork_result=_codex_attach_result(
+                thread_id="forked-thread-resume-only",
+                attach_mode="fork",
+                source_thread_id="external-thread-resume-only",
+            ),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-resume-only",
+            action_intent="resume",
+            codex_thread_id="external-thread-resume-only",
+        )
+
+        attach_service.resume_thread.assert_not_awaited()
+        attach_service.fork_thread.assert_not_awaited()
+        codex_agent.prepare_resume_binding.assert_not_awaited()
+        self.assertEqual(settings.routing_calls, [])
+        self.assertEqual(settings.set_calls, [])
+        self.assertEqual(settings.mark_calls, [])
+        self.assertEqual(len(settings.codex_attachment_upserts), seeded_attachment_writes)
+        self.assertEqual(len(im_client.messages), 1)
+        self.assertIn("action `fork`", im_client.messages[0][2])
+
+    async def test_codex_external_attach_fork_on_ambiguity_when_duplicate_binding_exists(self):
+        settings = _StubSettingsManager()
+        settings.upsert_codex_external_attachment(
+            "slack::OTHER",
+            "slack_existing",
+            binding_origin="external_attached",
+            codex_thread_id="external-thread-dup",
+            attach_mode="resume",
+            workspace_realpath="/Users/cyh/vibe-remote",
+            workspace_repo_root="/Users/cyh/vibe-remote",
+            workspace_fingerprint="repo:/Users/cyh/vibe-remote",
+            forked_from_thread_id=None,
+            attached_at="2026-04-19T12:00:00Z",
+            last_validated_at="2026-04-19T12:00:00Z",
+            validation_status="valid",
+        )
+        im_client = _StubIMClient()
+        ctrl = _StubController()
+        ctrl.init_minimal(im_client, settings, _StubConfig())
+        ctrl.im_client.should_use_thread_for_reply = lambda: True
+        ctrl.native_session_service = _StubNativeSessionService(
+            [_codex_attach_session(thread_id="external-thread-dup", allowed_actions=["resume", "fork"])]
+        )
+        attach_service = _StubCodexAttachService(
+            validation=_codex_validation(),
+            resume_result=_codex_attach_result(thread_id="external-thread-dup", attach_mode="resume"),
+            fork_result=_codex_attach_result(
+                thread_id="forked-thread-dup",
+                attach_mode="fork",
+                source_thread_id="external-thread-dup",
+            ),
+        )
+        codex_agent = SimpleNamespace(prepare_resume_binding=AsyncMock(), _attach_service=attach_service)
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": codex_agent})
+
+        await ctrl.session_handler.handle_resume_session_submission(
+            user_id="U123",
+            channel_id="C111",
+            thread_id="169999.123",
+            agent="codex",
+            session_id="external-thread-dup",
+            action_intent="resume",
+            codex_thread_id="external-thread-dup",
+        )
+
+        attach_service.resume_thread.assert_not_awaited()
+        attach_service.fork_thread.assert_awaited_once_with("/Users/cyh/vibe-remote", "external-thread-dup")
+        self.assertEqual(
+            settings.set_calls,
+            [("slack::C111", "codex", "slack_169999.123", "forked-thread-dup")],
+        )
+        attachment = settings.get_codex_external_attachment("slack::C111", "slack_169999.123")
+        self.assertIsNotNone(attachment)
+        assert attachment is not None
+        self.assertEqual(attachment.attach_mode, "fork")
+        self.assertEqual(attachment.codex_thread_id, "forked-thread-dup")
+        self.assertEqual(attachment.forked_from_thread_id, "external-thread-dup")
+
     async def test_handle_resume_session_submission_skips_resume_prepare_when_backend_has_no_hook(self):
         settings = _StubSettingsManager()
         im_client = _StubIMClient()
         ctrl = _StubController()
         ctrl.init_minimal(im_client, settings, _StubConfig())
-        ctrl.agent_service = type("A", (), {"agents": {"claude": object(), "codex": object()}})()
+        ctrl.agent_service = SimpleNamespace(agents={"claude": object(), "codex": object()})
 
         await ctrl.session_handler.handle_resume_session_submission(
             user_id="U123",
@@ -401,8 +829,9 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(im_client.messages, [])
         self.assertEqual(len(im_client.resume_calls), 1)
-        trigger_id, sessions, channel_id, thread_id, host_ts = im_client.resume_calls[0]
+        trigger_id, sessions, channel_id, thread_id, host_ts, working_path = im_client.resume_calls[0]
         self.assertEqual((trigger_id, channel_id, thread_id, host_ts), ("TRIG", "CCHAN", "TH1", "TS1"))
+        self.assertEqual(working_path, "/Users/cyh/vibe-remote")
         self.assertEqual([item.native_session_id for item in sessions], ["thread_123"])
         self.assertEqual(ctrl.native_session_service.calls, [("/Users/cyh/vibe-remote", 100)])
 
@@ -450,7 +879,7 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
         await ctrl.command_handler.handle_resume(ctx)
 
         self.assertEqual(len(im_client.resume_calls), 1)
-        _, sessions, _, _, _ = im_client.resume_calls[0]
+        _, sessions, _, _, _, _ = im_client.resume_calls[0]
         self.assertEqual([item.native_session_id for item in sessions], ["cx_enabled"])
 
     async def test_command_handlers_handle_resume_without_trigger_sends_menu_prompt(self):
@@ -510,9 +939,10 @@ class ResumeSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(im_client.messages, [])
         self.assertEqual(len(im_client.resume_calls), 1)
-        trigger_id, sessions, channel_id, thread_id, host_ts = im_client.resume_calls[0]
+        trigger_id, sessions, channel_id, thread_id, host_ts, working_path = im_client.resume_calls[0]
         self.assertEqual(trigger_id, ctx)
         self.assertEqual((channel_id, thread_id, host_ts), ("TGCHAN", "TOPIC1", "MSG1"))
+        self.assertEqual(working_path, "/Users/cyh/vibe-remote")
         self.assertEqual([item.native_session_id for item in sessions], ["session_telegram_123"])
         self.assertEqual(ctrl.native_session_service.calls, [("/Users/cyh/vibe-remote", 25)])
 
