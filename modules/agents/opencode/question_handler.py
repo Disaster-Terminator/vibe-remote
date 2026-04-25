@@ -744,8 +744,13 @@ class OpenCodeQuestionHandler:
             if modal_keyboard:
                 try:
                     logger.info(
-                        "Sending modal open button for %s (multiple=%s questions=%s)",
+                        "OpenCode question UI emit: kind=modal_button session=%s base_session=%s channel=%s thread=%s trigger_message_id=%s options=%s multiple=%s questions=%s",
                         opencode_session_id,
+                        request.base_session_id,
+                        request.context.channel_id,
+                        request.context.thread_id,
+                        request.context.message_id,
+                        len(option_labels),
                         multiple,
                         question_count,
                     )
@@ -798,8 +803,12 @@ class OpenCodeQuestionHandler:
             keyboard = InlineKeyboard(buttons=buttons)
             try:
                 logger.info(
-                    "Sending single-select buttons for %s (options=%s)",
+                    "OpenCode question UI emit: kind=single_select session=%s base_session=%s channel=%s thread=%s trigger_message_id=%s options=%s",
                     opencode_session_id,
+                    request.base_session_id,
+                    request.context.channel_id,
+                    request.context.thread_id,
+                    request.context.message_id,
                     len(option_labels),
                 )
                 question_message_id = await self._im_client.send_message_with_buttons(

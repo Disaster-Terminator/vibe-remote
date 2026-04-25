@@ -319,6 +319,15 @@ class QuestionUIHandler:
 
         keyboard = InlineKeyboard(buttons=buttons)
         try:
+            logger.info(
+                "Question UI emit: source=%s kind=inline_buttons base_session=%s channel=%s thread=%s trigger_message_id=%s options=%s",
+                self._callback_prefix,
+                request.base_session_id,
+                request.context.channel_id,
+                request.context.thread_id,
+                request.context.message_id,
+                len(option_labels),
+            )
             message_id = await self._im_client.send_message_with_buttons(
                 request.context,
                 text,
@@ -349,6 +358,15 @@ class QuestionUIHandler:
         )
 
         try:
+            logger.info(
+                "Question UI emit: source=%s kind=modal_trigger base_session=%s channel=%s thread=%s trigger_message_id=%s questions=%s",
+                self._callback_prefix,
+                request.base_session_id,
+                request.context.channel_id,
+                request.context.thread_id,
+                request.context.message_id,
+                pending.question_count,
+            )
             message_id = await self._im_client.send_message_with_buttons(
                 request.context,
                 text,

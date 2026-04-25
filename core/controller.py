@@ -516,6 +516,14 @@ class Controller:
         # Fall back to static routing
         platform = context.platform or (context.platform_specific or {}).get("platform") or self.primary_platform
         resolved = self.agent_router.resolve(platform, settings_key)
+        logger.info(
+            "Resolved backend after static routing: platform=%s settings_key=%s resolved=%s message_id=%s thread_id=%s",
+            platform,
+            settings_key,
+            resolved,
+            context.message_id,
+            context.thread_id,
+        )
 
         return resolved
 

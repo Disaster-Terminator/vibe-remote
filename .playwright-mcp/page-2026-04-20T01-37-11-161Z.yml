@@ -1,0 +1,109 @@
+- generic [ref=e4]:
+  - complementary [ref=e5]:
+    - generic [ref=e7]:
+      - img "Vibe Remote Logo" [ref=e8]
+      - generic [ref=e9]:
+        - heading "Vibe Remote" [level=1] [ref=e10]
+        - button "v0.0.0.dev0" [ref=e44] [cursor=pointer]: v0.0.0.dev0
+    - navigation [ref=e13]:
+      - link "仪表盘" [ref=e14] [cursor=pointer]:
+        - /url: /dashboard
+        - img [ref=e15]
+        - generic [ref=e20]: 仪表盘
+      - link "群组" [ref=e46] [cursor=pointer]:
+        - /url: /channels
+        - img [ref=e47]
+        - generic [ref=e49]: 群组
+      - link "用户" [ref=e21] [cursor=pointer]:
+        - /url: /users
+        - img [ref=e22]
+        - generic [ref=e27]: 用户
+      - link "诊断" [active] [ref=e28] [cursor=pointer]:
+        - /url: /doctor
+        - img [ref=e29]
+        - generic [ref=e31]: 诊断
+    - generic [ref=e32]:
+      - generic [ref=e33]:
+        - img [ref=e34]
+        - combobox [ref=e38] [cursor=pointer]:
+          - option "English"
+          - option "中文" [selected]
+      - generic [ref=e42]: 运行中
+  - main [ref=e43]:
+    - generic [ref=e228]:
+      - generic [ref=e229]:
+        - heading "系统状态" [level=2] [ref=e230]:
+          - img [ref=e231]
+          - text: 系统状态
+        - generic [ref=e233]:
+          - link "查看日志" [ref=e234] [cursor=pointer]:
+            - /url: /doctor/logs
+            - img [ref=e235]
+            - text: 查看日志
+          - button "复制报告" [ref=e238] [cursor=pointer]:
+            - img [ref=e239]
+            - text: 复制报告
+          - button "运行检查" [ref=e242] [cursor=pointer]:
+            - img [ref=e243]
+            - text: 运行检查
+      - generic [ref=e248]:
+        - generic [ref=e249]:
+          - generic [ref=e250]: Configuration
+          - generic [ref=e251]:
+            - generic [ref=e252]:
+              - img [ref=e254]
+              - generic [ref=e258]: "Configuration file found: /data/vibe_remote/config/config.json"
+            - generic [ref=e259]:
+              - img [ref=e261]
+              - generic [ref=e265]: Configuration loaded successfully
+        - generic [ref=e266]:
+          - generic [ref=e267]: Slack
+          - generic [ref=e268]:
+            - generic [ref=e269]:
+              - img [ref=e271]
+              - generic [ref=e275]: Slack token format is valid
+            - generic [ref=e276]:
+              - img [ref=e278]
+              - generic [ref=e282]: Bot token is configured
+            - generic [ref=e283]:
+              - img [ref=e285]
+              - generic [ref=e289]: App token is configured (Socket Mode)
+        - generic [ref=e290]:
+          - generic [ref=e291]: Agent Backends
+          - generic [ref=e292]:
+            - generic [ref=e293]:
+              - img [ref=e295]
+              - generic [ref=e299]: "OpenCode CLI found: /usr/local/bin/opencode"
+            - generic [ref=e300]:
+              - img [ref=e302]
+              - generic [ref=e306]: "Claude CLI found: /usr/local/bin/claude"
+            - generic [ref=e307]:
+              - img [ref=e309]
+              - generic [ref=e313]: "Codex CLI found: /usr/local/bin/codex"
+            - generic [ref=e314]:
+              - img [ref=e316]
+              - generic [ref=e320]: "Default backend: codex"
+        - generic [ref=e321]:
+          - generic [ref=e322]: Runtime
+          - generic [ref=e323]:
+            - generic [ref=e324]:
+              - img [ref=e326]
+              - generic [ref=e328]:
+                - generic [ref=e329]: "Working directory does not exist: /home/raystorm/work"
+                - generic [ref=e330] [cursor=pointer]: Update default_cwd in settings
+            - generic [ref=e331]:
+              - img [ref=e333]
+              - generic [ref=e337]: "Log level: INFO"
+            - generic [ref=e338]:
+              - img [ref=e340]
+              - generic [ref=e344]: "Log file: /data/vibe_remote/logs/vibe_remote.log"
+        - generic [ref=e345]:
+          - generic [ref=e346]:
+            - generic [ref=e347]: "11"
+            - generic [ref=e348]: 通过
+          - generic [ref=e349]:
+            - generic [ref=e350]: "1"
+            - generic [ref=e351]: 警告
+          - generic [ref=e352]:
+            - generic [ref=e353]: "0"
+            - generic [ref=e354]: 失败

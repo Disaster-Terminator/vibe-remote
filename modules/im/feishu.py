@@ -2930,13 +2930,13 @@ class FeishuBot(BaseIMClient):
         else:
             form_elements.append({"tag": "markdown", "content": "_No agent backends available_"})
 
-        # Submit button — encode thread context in name field
+        # Submit button — encode only compact thread context in name field.
         # (form_value loses behaviors.value, so we encode metadata in button name)
+        # Keep this small enough for Feishu's form field name limit.
         meta_parts = [
             "resume_submit",
             thread_id or "",
             host_message_ts or "",
-            working_path or "",
         ]
         submit_button_name = ":".join(meta_parts)
 

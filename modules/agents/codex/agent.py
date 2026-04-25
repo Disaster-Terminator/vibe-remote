@@ -888,6 +888,16 @@ class CodexAgent(BaseAgent):
         self._approval_ui.set_pending(base_session_id, pending_question)
 
         try:
+            logger.info(
+                "Codex approval UI render: session=%s base_session=%s thread=%s turn=%s item=%s method=%s trigger_message_id=%s",
+                request.composite_session_id,
+                base_session_id,
+                thread_id,
+                turn_id,
+                item_id,
+                method,
+                request.context.message_id,
+            )
             prompt_message_id = await self._approval_ui.render_question_ui(request, pending_question)
             pending_question.prompt_message_id = prompt_message_id
             self._session_mgr.update_pending_approval_prompt_message(base_session_id, prompt_message_id)

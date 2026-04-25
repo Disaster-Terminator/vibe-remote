@@ -1,0 +1,12 @@
+{
+  "active_plan": "/home/raystorm/projects/vibe-remote-secondary-vr-attach-master/.sisyphus/plans/codex-external-thread-attach.md",
+  "started_at": "2026-04-19T14:44:16.875Z",
+  "session_ids": [
+    "ses_259f13cfcffefiml2OsLPW4J4A"
+  ],
+  "session_origins": {
+    "ses_259f13cfcffefiml2OsLPW4J4A": "direct"
+  },
+  "plan_name": "codex-external-thread-attach",
+  "agent": "atlas"
+}

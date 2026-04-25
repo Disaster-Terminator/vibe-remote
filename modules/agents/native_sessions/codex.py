@@ -41,7 +41,15 @@ class CodexNativeSessionProvider(NativeSessionProvider):
         sqlite_items = self._list_sqlite_metadata(working_path)
         attach_items = self._list_attach_metadata(working_path, sqlite_items)
         if attach_items is not None:
-            return attach_items
+            attach_ids = {item.native_session_id for item in attach_items}
+            sqlite_only = [
+                self._mark_attach_unavailable(item)
+                for item in sqlite_items
+                if item.native_session_id not in attach_ids
+            ]
+            combined = attach_items + sqlite_only
+            combined.sort(key=lambda item: (item.sort_ts, item.native_session_id), reverse=True)
+            return combined
         return [self._mark_attach_unavailable(item) for item in sqlite_items]
 
     def _list_sqlite_metadata(self, working_path: str) -> list[NativeResumeSession]:

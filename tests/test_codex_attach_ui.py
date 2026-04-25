@@ -179,6 +179,7 @@ def _install_discord_stubs() -> None:
 _install_slack_stubs()
 _install_discord_stubs()
 
+from modules.im import discord as discord_module
 from modules.im.discord import DiscordBot
 from modules.im.feishu import FeishuBot
 from modules.im.resume_picker import build_resume_picker_entries
@@ -351,20 +352,27 @@ class _FakeDiscordChannel:
 
 
 class _FakeDiscordResponse:
-    def __init__(self):
+    def __init__(self, done=False):
         self.defer = AsyncMock()
         self.edit_message = AsyncMock()
         self.send_message = AsyncMock()
+        self._done = done
 
     def is_done(self):
-        return False
+        return self._done
+
+
+class _FakeDiscordFollowup:
+    def __init__(self):
+        self.send = AsyncMock()
 
 
 class _FakeDiscordInteraction:
-    def __init__(self, user_id="U1"):
+    def __init__(self, user_id="U1", response_done=False):
         self.user = SimpleNamespace(id=user_id)
         self.guild = None
-        self.response = _FakeDiscordResponse()
+        self.response = _FakeDiscordResponse(done=response_done)
+        self.followup = _FakeDiscordFollowup()
 
 
 class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
@@ -755,6 +763,25 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resume_call.kwargs["action_intent"], "fork")
         self.assertEqual(resume_call.kwargs["codex_thread_id"], "thread_attach_123")
 
+    async def test_feishu_resume_submit_name_stays_compact_without_working_path(self):
+        bot = _FeishuHarness.__new__(_FeishuHarness)
+        bot._send_card_to_channel = AsyncMock()
+        sessions = [_codex_attach_session()]
+
+        await bot.open_resume_session_modal(
+            trigger_id=None,
+            sessions=sessions,
+            channel_id="LK1",
+            thread_id="OT1",
+            host_message_ts="HOST1",
+            working_path="/home/raystorm/projects/some/very/long/path/that/should/not/be/encoded/into/the/form/submit/name",
+        )
+
+        send_call = bot._send_card_to_channel.await_args_list[0]
+        card = send_call.args[1]
+        submit_button = card["body"]["elements"][0]["elements"][-1]
+        self.assertEqual(submit_button["name"], "resume_submit:OT1:HOST1")
+
     async def test_feishu_attach_callback_rejects_wrong_user_without_consuming_token(self):
         bot = _FeishuHarness.__new__(_FeishuHarness)
         bot._resume_attach_cache = {
@@ -805,6 +832,27 @@ class CodexAttachUITests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(await view.interaction_check(_FakeDiscordInteraction(user_id="OWNER")))
         self.assertFalse(await view.interaction_check(_FakeDiscordInteraction(user_id="OTHER")))
+
+    async def test_discord_resume_view_uses_followup_when_interaction_already_deferred(self):
+        bot = _DiscordHarness.__new__(_DiscordHarness)
+        bot._controller = SimpleNamespace(agent_service=SimpleNamespace(agents={"codex": object(), "claude": object(), "opencode": object()}))
+        interaction = _FakeDiscordInteraction(response_done=True)
+
+        original_interaction_cls = discord_module.discord.Interaction
+        discord_module.discord.Interaction = _FakeDiscordInteraction
+        try:
+            await bot.open_resume_session_modal(
+                trigger_id=interaction,
+                sessions=[_codex_attach_session()],
+                channel_id="C1",
+                thread_id="TH1",
+                host_message_ts="MSG1",
+            )
+        finally:
+            discord_module.discord.Interaction = original_interaction_cls
+
+        interaction.response.send_message.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
 
     async def test_feishu_preview_only_codex_attach_stays_preview_only(self):
         bot = _FeishuHarness.__new__(_FeishuHarness)

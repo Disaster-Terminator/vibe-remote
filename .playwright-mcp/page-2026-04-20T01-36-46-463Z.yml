@@ -1,0 +1,66 @@
+- generic [ref=e4]:
+  - complementary [ref=e5]:
+    - generic [ref=e7]:
+      - img "Vibe Remote Logo" [ref=e8]
+      - generic [ref=e9]:
+        - heading "Vibe Remote" [level=1] [ref=e10]
+        - button "v0.0.0.dev0" [ref=e44] [cursor=pointer]: v0.0.0.dev0
+    - navigation [ref=e13]:
+      - link "仪表盘" [ref=e14] [cursor=pointer]:
+        - /url: /dashboard
+        - img [ref=e15]
+        - generic [ref=e20]: 仪表盘
+      - link "群组" [active] [ref=e46] [cursor=pointer]:
+        - /url: /channels
+        - img [ref=e47]
+        - generic [ref=e49]: 群组
+      - link "用户" [ref=e21] [cursor=pointer]:
+        - /url: /users
+        - img [ref=e22]
+        - generic [ref=e27]: 用户
+      - link "诊断" [ref=e28] [cursor=pointer]:
+        - /url: /doctor
+        - img [ref=e29]
+        - generic [ref=e31]: 诊断
+    - generic [ref=e32]:
+      - generic [ref=e33]:
+        - img [ref=e34]
+        - combobox [ref=e38] [cursor=pointer]:
+          - option "English"
+          - option "中文" [selected]
+      - generic [ref=e42]: 运行中
+  - main [ref=e43]:
+    - generic [ref=e185]:
+      - generic [ref=e187]:
+        - heading "群组设置" [level=2] [ref=e188]
+        - paragraph [ref=e189]: 启用群组并配置每个群组的路由
+      - generic [ref=e190]:
+        - button "Slack" [ref=e191] [cursor=pointer]
+        - button "Discord" [ref=e192] [cursor=pointer]
+        - button "飞书" [ref=e193] [cursor=pointer]
+      - generic [ref=e194]:
+        - generic [ref=e195]:
+          - img [ref=e196]
+          - generic [ref=e199]: 需要 @提及
+          - generic [ref=e200]: 机器人仅在被 @提及时响应
+        - button [ref=e201] [cursor=pointer]
+      - generic [ref=e203]:
+        - generic [ref=e204]:
+          - generic [ref=e205]:
+            - button "刷新列表" [ref=e206] [cursor=pointer]:
+              - img [ref=e207]
+              - text: 刷新列表
+            - button "浏览所有群组" [ref=e212] [cursor=pointer]:
+              - img [ref=e213]
+              - text: 浏览所有群组
+            - generic [ref=e216]:
+              - generic [ref=e217]:
+                - img [ref=e218]
+                - text: 找不到你想要的群组？
+              - generic: 请先将 Bot 邀请到频道： 1. 打开频道，点击 ⚙️ 设置 → 集成 → 添加应用 2. 或在频道中输入 /invite @你的Bot名称
+            - generic [ref=e221]: 未找到群组，请检查令牌或邀请机器人
+          - generic [ref=e222]: 已启用 0 个
+        - generic [ref=e223]:
+          - generic [ref=e224]: 访问策略
+          - generic [ref=e225]: 只有勾选的群组才会启用
+      - generic [ref=e227]: 未加载群组

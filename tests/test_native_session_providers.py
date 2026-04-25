@@ -293,6 +293,65 @@ def test_codex_attach_provider_emits_attach_aware_metadata(tmp_path: Path) -> No
     assert hydrated.last_agent_tail.startswith("...")
 
 
+def test_codex_attach_provider_keeps_sqlite_only_threads_when_catalog_is_partial(tmp_path: Path) -> None:
+    working_path = tmp_path / "repo"
+    working_path.mkdir()
+    (working_path / ".git").mkdir()
+    db_path = tmp_path / "state_5.sqlite"
+    _write_codex_threads_db(
+        db_path,
+        str(working_path),
+        [
+            ("thread-app", 10, 25, "App title", "App first prompt", "", 0),
+            ("thread-sqlite-only", 11, 30, "SQLite title", "SQLite first prompt", "", 0),
+        ],
+    )
+    requested_workspace = _codex_workspace_identity(str(working_path))
+    attach_service = SimpleNamespace(
+        list_threads=AsyncMock(
+            return_value=CodexThreadListResult(
+                threads=[
+                    CodexThreadSummary(
+                        thread_id="thread-app",
+                        thread={
+                            "id": "thread-app",
+                            "name": "App title",
+                            "preview": "App preview",
+                            "createdAt": 10,
+                            "updatedAt": 25,
+                            "path": None,
+                            "cwd": str(working_path),
+                            "ephemeral": False,
+                        },
+                        workspace=requested_workspace,
+                        workspace_validation=_codex_validation(
+                            requested_workspace,
+                            candidate_workspace=requested_workspace,
+                            status="valid",
+                            is_valid=True,
+                            message="Workspace validation succeeded.",
+                        ),
+                    )
+                ],
+                next_cursor=None,
+                raw_result={},
+            )
+        )
+    )
+    provider = CodexNativeSessionProvider(db_path=str(db_path), attach_service=cast(Any, attach_service))
+
+    items = provider.list_metadata(str(working_path))
+
+    assert [item.native_session_id for item in items] == ["thread-sqlite-only", "thread-app"]
+    sqlite_only = items[0]
+    assert sqlite_only.locator["attach_source"] == "sqlite_fallback"
+    assert sqlite_only.locator["attach_service_available"] is False
+    assert sqlite_only.locator["allowed_actions"] == ["inspect_only"]
+    attach_item = items[1]
+    assert attach_item.locator["attach_source"] == "app_server"
+    assert attach_item.locator["allowed_actions"] == ["resume", "fork"]
+
+
 def test_codex_attach_fallback_when_attach_service_unavailable(tmp_path: Path) -> None:
     working_path = str(tmp_path / "repo")
     Path(working_path).mkdir()

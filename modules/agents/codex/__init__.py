@@ -1,11 +1,9 @@
 """Codex agent package — persistent app-server mode."""
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .agent import CodexAgent as CodexAgent
-else:
-    CodexAgent = cast(Any, None)
 
 __all__ = ["CodexAgent"]
 

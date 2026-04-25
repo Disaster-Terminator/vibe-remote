@@ -142,6 +142,19 @@ class DiscordBot(BaseIMClient):
             platform_specific={"interaction": interaction, "is_dm": is_dm},
         )
 
+    async def _send_ephemeral_interaction_view(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: Optional[str] = None,
+        embed: Optional[discord.Embed] = None,
+        view: Optional[discord.ui.View] = None,
+    ) -> None:
+        if interaction.response.is_done():
+            await interaction.followup.send(content=content, embed=embed, view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=True)
+
     async def _dispatch_callback_query(self, context: MessageContext, data: str) -> None:
         if self.on_callback_query_callback:
             await self.on_callback_query_callback(context, data)
@@ -946,7 +959,17 @@ class DiscordBot(BaseIMClient):
         )
 
         # Handle slash-like commands in plain messages
-        if self.parse_text_command(content, allow_plain_bind=allow_plain_bind):
+        parsed_command = self.parse_text_command(content, allow_plain_bind=allow_plain_bind)
+        if parsed_command:
+            logger.info(
+                "Discord inbound command candidate: message_id=%s channel=%s thread=%s user=%s content=%r parsed=%s",
+                message.id,
+                channel_id,
+                thread_id,
+                message.author.id,
+                content,
+                parsed_command,
+            )
             command_context = MessageContext(
                 user_id=str(message.author.id),
                 channel_id=channel_id,
@@ -956,6 +979,13 @@ class DiscordBot(BaseIMClient):
                 files=files,
             )
             if await self.dispatch_text_command(command_context, content, allow_plain_bind=allow_plain_bind):
+                logger.info(
+                    "Discord command dispatched: message_id=%s channel=%s thread=%s parsed=%s",
+                    message.id,
+                    channel_id,
+                    thread_id,
+                    parsed_command,
+                )
                 return
 
         if not content and not files:
@@ -981,6 +1011,21 @@ class DiscordBot(BaseIMClient):
         )
 
         if self.on_message_callback:
+            resolved_backend = None
+            if self._controller is not None:
+                try:
+                    resolved_backend = self._controller.resolve_agent_for_context(context)
+                except Exception as err:
+                    resolved_backend = f"error:{err}"
+            logger.info(
+                "Discord inbound message dispatch: message_id=%s channel=%s thread=%s user=%s backend=%s content=%r",
+                message.id,
+                channel_id,
+                thread_id,
+                message.author.id,
+                resolved_backend,
+                content,
+            )
             await self.on_message_callback(context, content)
 
     # ---------------------------------------------------------------------
@@ -1210,11 +1255,7 @@ class DiscordBot(BaseIMClient):
             description=self._t("discord.settingsSubtitle"),
         )
         if interaction:
-            await interaction.response.send_message(
-                embed=settings_embed,
-                view=view,
-                ephemeral=True,
-            )
+            await self._send_ephemeral_interaction_view(interaction, embed=settings_embed, view=view)
         else:
             channel = await self._fetch_channel(channel_id)
             if channel is None:
@@ -1456,7 +1497,7 @@ class DiscordBot(BaseIMClient):
         intro_text = view._content()
 
         if interaction:
-            await interaction.response.send_message(intro_text, view=view, ephemeral=True)
+            await self._send_ephemeral_interaction_view(interaction, content=intro_text, view=view)
         else:
             channel = await self._fetch_channel(channel_id)
             if channel is None:
@@ -1998,7 +2039,7 @@ class DiscordBot(BaseIMClient):
             description=self._t("discord.routingSubtitle"),
         )
         if interaction:
-            await interaction.response.send_message(embed=routing_embed, view=view, ephemeral=True)
+            await self._send_ephemeral_interaction_view(interaction, embed=routing_embed, view=view)
         else:
             channel = await self._fetch_channel(channel_id)
             if channel is None:
@@ -2175,7 +2216,8 @@ class _PersistentStartView(discord.ui.View):
                 "cmd_routing",
                 "cmd_resume",
             }
-            if not needs_modal:
+            should_defer = data in {"cmd_settings", "cmd_routing", "cmd_resume", "opencode_question:open_modal"}
+            if should_defer or not needs_modal:
                 try:
                     await interaction.response.defer(ephemeral=True)
                 except Exception:
@@ -2248,7 +2290,8 @@ class _DiscordButtonView(discord.ui.View):
                         "cmd_routing",
                         "cmd_resume",
                     }
-                    if data == "opencode_question:open_modal":
+                    should_defer = data in {"cmd_settings", "cmd_routing", "cmd_resume", "opencode_question:open_modal"}
+                    if should_defer:
                         try:
                             await interaction.response.defer(ephemeral=True)
                         except Exception:
